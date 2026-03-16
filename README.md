@@ -1,4 +1,4 @@
-# Matcha: Fast Subtomogram Alignment by Frequency-Marched Newton
+# Matcha: Fast Volume Alignment by Frequency-Marched Newton
 
 > Official implementation of **"Fast Volume Alignment by Frequency-Marched Newton"**
 
