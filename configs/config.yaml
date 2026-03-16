@@ -1,0 +1,73 @@
+# Minimal config for `python src/run.py --align`
+
+random_seed: 42
+
+# Input data
+# path_templates:
+#   - "/path/to/half1_template.mrc"
+#   - "/path/to/half2_template.mrc"
+# path_template_mask: ""
+
+path_templates:
+  - "/path/to/half1_template.mrc"
+  - "/path/to/half2_template.mrc"
+path_template_mask: "" # optional, leave empty to skip
+
+path_subtomograms: "/path/to/Subtomograms"
+subdirs_subtomograms: [] # e.g. ["tomo001", "tomo002"]
+subtomograms_file: ""
+run_data_path: "/path/to/run_it000_data.star"
+
+# Output
+path_output: "debugging"
+tmp_dir: "tmp"
+outputs_dir: "outputs"
+bin_factor: 2
+
+# FLE basis lookup tables
+cs_path: "data/cs_l=3000_k=2500.mat"
+jl_zeros_path: "data/jl_zeros_l=3000_k=2500.mat"
+
+# Dataset meta
+relion_version: "relion5" # "relion5" or "relion_old"
+subset_IDs: [1, 2]
+voxel_size: 3.82 #*1.91
+box_size: 570
+
+# Compute
+gpu_ids: [2]
+precision: "float32" # "float32" or "float64"
+
+# Batch/search settings
+num_subtomograms_per_batch: 80
+num_base_shifts: 1
+num_alternations: 3 #from command line
+upsample_factors: [1, 10, 100]
+
+# Rotation initialization
+use_prior_rotation: false
+use_precenter: false
+
+# Correlator settings
+N: 100 # read this from file
+bandlimit: 40
+expansion_epsilon: 0.0001
+radius: 50
+reduce_memory: true
+micro_batch_split: 2
+
+# Keep search band consistent with the original full config
+newton_ls: [40]
+so3fft_oversampling_factor: 2
+
+# Optional Matcha config (recommended for explicit control)
+matcha_config:
+  Li: [30, 40]
+  candidates: 10
+  reinits: 1
+  num_steps: 5
+  step_type: "newton"
+  stop_early: false
+  do_random_sampling: false
+  reinits_iterations: 0
+  oversampling_factor_K: 2

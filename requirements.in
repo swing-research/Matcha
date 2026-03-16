@@ -1,0 +1,18 @@
+# requirements.in (runtime)
+
+# PyTorch CUDA wheels (you’ll compile/install with the specific index)
+torch
+torchvision
+torchaudio
+
+# Additional dependencies
+numba-cuda[cu12]
+spherical
+quaternionic
+starfile
+cufinufft
+finufft
+mrcfile
+pyaml
+ml-collections
+torch-harmonics

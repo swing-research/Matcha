@@ -1,0 +1,43 @@
+[project]
+name = "matcha"
+version = "0.1.0"
+description = "An efficient tool for subtomogram averaging using continuous optimization."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "numba-cuda[cu12]",
+  "numpy",
+  "scipy",
+  "pandas",
+  "pyyaml",
+  "spherical",
+  "quaternionic",
+  "starfile",
+  "cufinufft",
+  "finufft",
+  "mrcfile",
+  "ml-collections",
+  "torch-harmonics",
+]
+
+[project.optional-dependencies]
+dev = ["pip-tools"]
+
+[project.scripts]
+matcha = "run:cli"
+matcha-example = "example:cli"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["run", "example", "align_subtomograms"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["matcha", "core", "utils"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

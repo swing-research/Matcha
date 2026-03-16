@@ -1,0 +1,43 @@
+# Minimal config for `python src/example.py --config configs/config_example.yaml`
+
+random_seed: 42
+
+# Input template and FLE lookup tables
+path_template: "data/run2_class001.mrc" #"/path/to/template.mrc"
+jl_zeros_path: "data/jl_zeros_l=3000_k=2500.mat"
+cs_path: "data/cs_l=3000_k=2500.mat"
+
+# Volume / expansion settings
+N: 200
+expansion_epsilon: 0.0001
+
+# Orientation-search backend
+orientation_search:
+  method: "matcha" # "matcha" or "sofft"
+  timing:
+    warmup_runs: 1 # number of warmup runs to exclude from timing
+    timed_runs: 2 # number of runs to time and average over
+    print_per_batch: false
+
+# SOFFT settings (used when orientation_search.method == "sofft")
+sofft_config:
+  L_max: 40
+  oversampling_factor_K: 1
+
+# Matcha settings (used when orientation_search.method == "matcha")
+matcha_config:
+  Li: [30, 40, 60]
+  oversampling_factor_K: 2
+  candidates: 10
+  reinits: 1
+  do_random_sampling: false
+  step_type: "newton"
+  num_steps: 1
+  stop_early: false
+
+example_config:
+  number_subtomograms: 1000 # number of subtomograms to process
+  batchsize: 10 # number of subtomograms per batch
+  snr_db: 0.0 # SNR in dB for simulated subtomograms
+  masking_radius: 70 # radius of spherical mask applied to subtomograms (in pixels)
+  L_max: 100 # bandlimit for simulated subtomograms (in Fourier space)
