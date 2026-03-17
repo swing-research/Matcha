@@ -2,7 +2,7 @@
 
 > Official implementation of **"Fast Volume Alignment by Frequency-Marched Newton"**
 
-Matcha aligns volumes against a reference template via continuous SO(3) optimisation via frequency-marched Newton refinements. It can be integrated into subtomogram alignment for rapid Subtomogram Averaging (STA) in Cryo-ET and runs as a stand-alone CLI tool or directly as a **RELION External job**.
+Matcha aligns volumes against a reference template via continuous SO(3) optimisation with frequency-marched Newton refinements. It can be integrated into subtomogram alignment for rapid Subtomogram Averaging (STA) in Cryo-ET and runs as a stand-alone CLI tool or directly as a **RELION External job**.
 
 
 ---
