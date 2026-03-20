@@ -171,7 +171,7 @@ matcha --o External/jobXXX/       \
 
 To run Matcha as a RELION `External` job from the GUI, create a new `External` job and fill the `Input` tab as follows:
 
-Before creating the `External` job, make sure the subtomogram extraction job was run with 3D output enabled: choose either `3D subtomos` or `3D pseudo-subtomos` during extraction.
+Before creating the `External` job, make sure the subtomogram extraction job `Extract subtomos` was run with 3D output enabled: choose either `3D subtomos` or `3D pseudo-subtomos` during extraction.
 
 For queued RELION jobs, make sure the submission environment loads the Matcha Python environment before launching the `External` executable.
 
