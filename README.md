@@ -156,16 +156,52 @@ matcha --o External/jobXXX/       \
        --j         <threads>
 ```
 
-| Behaviour       | Details                                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------------------- |
-| I/O override    | `--o`, `--in_parts`, `--in_3dref`, `--in_mask`, `--j`, GPU flags override the config                    |
-| `--mask_diameter` | Mask diameter in Å (same as the RELION GUI field). Sets `box_size = round(mask_diameter / voxel_size)` |
-| `--offset_range`  | Shift search radius in pixels (same as the RELION GUI "Offset range" field). Overrides `shift_search_radius` in the config |
-| Half-map pair   | If `--in_3dref` contains `half1`/`half2`, the counterpart is required at the same location              |
-| Single map      | If neither tag is present, the same map is used for both halves                                         |
-| Particle split  | Particles are split randomly into two halves from the input STAR                                        |
-| Output          | Particles STAR written to `<--o>/matcha_particles.star`; config copied to `<--o>/matcha_config.yaml`    |
-| Lifecycle files | `RELION_JOB_EXIT_SUCCESS` / `RELION_JOB_EXIT_FAILURE` and `RELION_OUTPUT_NODES.star` written to `<--o>` |
+<table>
+  <colgroup>
+    <col style="width: 35%;">
+    <col style="width: 65%;">
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Behaviour</th>
+      <th>Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>I/O override</td>
+      <td><code>--o</code>, <code>--in_parts</code>, <code>--in_3dref</code>, <code>--in_mask</code>, <code>--j</code>, GPU flags override the config</td>
+    </tr>
+    <tr>
+      <td><code>--mask_diameter</code></td>
+      <td>Mask diameter in Å (same as the RELION GUI field). Sets <code>box_size = round(mask_diameter / voxel_size)</code></td>
+    </tr>
+    <tr>
+      <td><code>--offset_range</code></td>
+      <td>Shift search radius in pixels (same as the RELION GUI "Offset range" field). Overrides <code>shift_search_radius</code> in the config</td>
+    </tr>
+    <tr>
+      <td>Half-map pair</td>
+      <td>If <code>--in_3dref</code> contains <code>half1</code>/<code>half2</code>, the counterpart is required at the same location</td>
+    </tr>
+    <tr>
+      <td>Single map</td>
+      <td>If neither tag is present, the same map is used for both halves</td>
+    </tr>
+    <tr>
+      <td>Particle split</td>
+      <td>Particles are split randomly into two halves from the input STAR</td>
+    </tr>
+    <tr>
+      <td>Output</td>
+      <td>Particles STAR written to <code>&lt;--o&gt;/matcha_particles.star</code>; config copied to <code>&lt;--o&gt;/matcha_config.yaml</code></td>
+    </tr>
+    <tr>
+      <td>Lifecycle files</td>
+      <td><code>RELION_JOB_EXIT_SUCCESS</code> / <code>RELION_JOB_EXIT_FAILURE</code> and <code>RELION_OUTPUT_NODES.star</code> written to <code>&lt;--o&gt;</code></td>
+    </tr>
+  </tbody>
+</table>
 
 ### RELION GUI setup
 
