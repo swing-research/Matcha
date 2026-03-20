@@ -1,3 +1,10 @@
+"""
+Wigner D-matrix computation for SO(3).
+
+Adapted from the reference implementation by Michael Boyle:
+  https://github.com/moble/spherical
+"""
+
 import numpy as np
 from numba import cuda
 import numba 

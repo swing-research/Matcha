@@ -1,3 +1,16 @@
+"""
+Fourier–Laguerre Expansion (FLE) basis for 3D volumes on the ball.
+
+Adapted from the reference implementation by Oscar Mickelin:
+  https://github.com/oscarmickelin/fle_3d
+
+Based on:
+  Kileel, J., Marshall, N. F., Mickelin, O., & Singer, A. (2025).
+  Fast Expansion Into Harmonics on the Ball.
+  SIAM Journal on Scientific Computing.
+  https://epubs.siam.org/doi/10.1137/24M1668159
+"""
+
 import numpy as np
 import scipy.special as spl
 import scipy.sparse as spr
@@ -39,9 +52,8 @@ class FLEBasis3D:
         device = 'cuda', 
         dtype = torch.complex128,
         jl_zeros_path="jl_zeros_l=3000_k=2500.mat",
-        cs_path="cs_l=3000_k=2500.mat"
-
-
+        cs_path="cs_l=3000_k=2500.mat",
+        precision_mode="accurate",
     ):
         self.batchsize = batchsize
         realmode = mode == "real"
@@ -55,6 +67,7 @@ class FLEBasis3D:
         self.device = device
         self.jl_zeros_path = jl_zeros_path
         self.cs_path = cs_path
+        self.precision_mode = precision_mode
 
 
         if not maxitr:
@@ -194,12 +207,15 @@ class FLEBasis3D:
 
         S = max(S2, 2 * self.lmax, 18)
 
-        epsnufH = max(
-            eps
-            / (2 * np.pi ** (3 / 2) * (3 / 2) ** (1 / 4))
-            / (2 + np.pi / 2 * np.log(Q)),
-            1.1e-15,
-        )
+        if self.precision_mode == "fast":
+            epsnufH = 1e-4
+        else:
+            epsnufH = max(
+                eps
+                / (2 * np.pi ** (3 / 2) * (3 / 2) ** (1 / 4))
+                / (2 + np.pi / 2 * np.log(Q)),
+                1.1e-15,
+            )
         epsnuf = max(
             1
             / 4
@@ -350,9 +366,6 @@ class FLEBasis3D:
         self.idlm_list = idlm_list
         self.idlm_list_torch = idlm_list_torch
 
-        
-
-
         ######## Create NUFFT plans
         lmd0 = np.min(lmds)
         lmd1 = np.max(lmds)
@@ -396,8 +409,6 @@ class FLEBasis3D:
         self.grid_z = z
 
         nufft_type = 2
-        epsnufH = 0.001
-        
         self.plan2_batched = cufinufft.Plan(
             nufft_type,
             (N, N, N),
@@ -524,15 +535,6 @@ class FLEBasis3D:
         # Find the maximum number of rows and columns
         max_rows = max(A.shape[0] for A in self.A3_torch)
         max_cols = max(A.shape[1] for A in self.A3_torch)
-
-        # # Pad all tensors to the maximum size
-        # A3_padded = [
-        #     F.pad(A, (0, max_cols - A.shape[1], 0, max_rows - A.shape[0]))  # Pad columns first, then rows
-        #     for A in self.A3_torch
-        # ]
-
-        # Stack the padded tensors
-        #self.A3_batched = torch.stack(A3_padded)  # Now all tensors have shape (max_rows, max_cols)
 
         self.signs = torch.tensor([(-1) ** (k + 1) for k in range(self.lmax)], dtype=torch.int32, device=self.device).view(1, 1, -1)
         
@@ -940,7 +942,7 @@ class FLEBasis3D:
         return a
     
 
-    def evaluate_t_torch(self, f:torch.tensor, return_step=3):
+    def evaluate_t(self, f:torch.tensor, return_step=3):
         if f.shape[0] == self.batchsize:
             #f = torch.clone(f).view(self.batchsize, self.N1, self.N1, self.N1)
             f = f.view(self.batchsize, self.N1, self.N1, self.N1)

@@ -8,7 +8,7 @@ from ml_collections import ConfigDict
 import starfile 
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
-from utils.volume_ops import normalise_torch
+from utils.volume_ops import normalise
 
 
 def _particle_token(path_like: str) -> str:
@@ -36,6 +36,35 @@ def _worker_pickle_prefix(config: ConfigDict) -> str:
     return str(config.path_output)
 
 
+def _center_crop_or_pad(arr: np.ndarray, target_shape: tuple) -> np.ndarray:
+    """Center-crop or zero-pad a 3D array to target_shape."""
+    result = np.zeros(target_shape, dtype=arr.dtype)
+    slices_src, slices_dst = [], []
+    for s, t in zip(arr.shape, target_shape):
+        if s >= t:
+            start = (s - t) // 2
+            slices_src.append(slice(start, start + t))
+            slices_dst.append(slice(None))
+        else:
+            start = (t - s) // 2
+            slices_src.append(slice(None))
+            slices_dst.append(slice(start, start + s))
+    result[tuple(slices_dst)] = arr[tuple(slices_src)]
+    return result
+
+
+def mask_effective_radius(mask_path: str, N: int) -> float:
+    """Return the maximum voxel distance from the center to any non-zero voxel in the mask."""
+    mask = np.asarray(mrcfile.open(mask_path, permissive=True).data, dtype=np.float32)
+    if mask.shape != (N, N, N):
+        mask = _center_crop_or_pad(mask, (N, N, N))
+    c = N / 2.0
+    z, y, x = np.ogrid[:N, :N, :N]
+    dist = np.sqrt((z - c) ** 2 + (y - c) ** 2 + (x - c) ** 2)
+    nonzero = mask > 0.5
+    return float(dist[nonzero].max()) if nonzero.any() else N / 2.0
+
+
 def load_template(path_template: str,
                   spherical_mask: torch.Tensor,
                   dtype: torch.dtype,
@@ -54,13 +83,12 @@ def load_template(path_template: str,
 
     if path_template_mask != "":
         template_mask = mrcfile.open(path_template_mask).data
-        if template_mask.shape[0] != template.shape[0]:
-            
-            template_mask = template_mask[68:68+template.shape[0], 68:68+template.shape[1], 68:68+template.shape[2]]
+        if template_mask.shape != template.shape:
+            template_mask = _center_crop_or_pad(template_mask, template.shape)
         template = template * template_mask
 
     # Normalise template under mask
-    #template = normalise_torch(template, spherical_mask) * spherical_mask
+    #template = normalise(template, spherical_mask) * spherical_mask
     return template
 
 def _get_base_coords_zyx(shape: tuple, center: tuple, device: torch.device) -> torch.Tensor:
@@ -82,7 +110,7 @@ def _get_base_coords_zyx(shape: tuple, center: tuple, device: torch.device) -> t
     base_coords = torch.stack((Z,Y,X), dim=-1)  # shape (D, H, W, 3)
     return base_coords
 
-def extract_patch_torch_batch2(volume: torch.Tensor, 
+def extract_subtomogram_patch_batch(volume: torch.Tensor, 
                               shift: torch.Tensor, 
                               config: ConfigDict, 
                               normalize: bool = True, 
@@ -145,7 +173,7 @@ def extract_patch_torch_batch2(volume: torch.Tensor,
                         patch[tuple(idx)] = 0
 
             if normalize:
-                patch = normalise_torch(patch, config["execution"]["spherical_mask_torch"]) * config["execution"]["spherical_mask_torch"]
+                patch = normalise(patch, config["execution"]["spherical_mask_torch"]) * config["execution"]["spherical_mask_torch"]
             batched_tomogram_data[b, s] = patch
     return batched_tomogram_data.view(-1, *config["execution"]["shape" ])
 
@@ -174,23 +202,22 @@ def store_alignment_parameters(config: ConfigDict,
     - alternation_index: int, index of the current alternation (optional).
     """
     # Initialize result DataFrame
-    num_base_shifts = config["num_base_shifts"]
     num_subtomograms_per_batch = config["num_subtomograms_per_batch"]
 
     # Store highest scoring alignment
-    max_ids = torch.argmax(rotation_scores.view(num_subtomograms_per_batch, num_base_shifts), dim=1)
-    
+    max_ids = torch.argmax(rotation_scores.view(num_subtomograms_per_batch, 1), dim=1)
+
     for i,tomogram_file_name in enumerate(tomogram_file_names):
-        
+
         max_id = max_ids[i]
         result_data.loc[len(result_data)] ={"path": tomogram_file_name,
-                                            "rotation_score": rotation_scores.view(num_subtomograms_per_batch, num_base_shifts)[i,max_id].item(),
-                                            "rotation": quaternionic.array(rotation_tracker.reshape(num_subtomograms_per_batch, num_base_shifts, -1)[i, max_id]).to_euler_angles,
+                                            "rotation_score": rotation_scores.view(num_subtomograms_per_batch, 1)[i,max_id].item(),
+                                            "rotation": quaternionic.array(rotation_tracker.reshape(num_subtomograms_per_batch, 1, -1)[i, max_id]).to_euler_angles,
                                             "translation": local_shifts[i,max_id].cpu().numpy(),
                                             "file_name": tomogram_file_name.split("/")[-1],
                                             "prior_shift": prior_shifts[i, max_id].cpu().numpy(),
                                             "alternation_index": alternation_index if alternation_index is not None else 0,
-                                            "shift_score": shift_scores.view(num_subtomograms_per_batch, num_base_shifts)[i,max_id].item(),
+                                            "shift_score": shift_scores.view(num_subtomograms_per_batch, 1)[i,max_id].item(),
                                             "rlnTomoParticleName": _particle_token(tomogram_file_name),
                                             "half": half,
                                             }
@@ -210,22 +237,6 @@ def load_subtomogram_cpu(path: str, dtype=np.float32) -> torch.Tensor:
         arr = np.asarray(m.data, dtype=dtype, order="C", copy=True)
     return arr
 
-def load_ctf_cpu(filepath: str, transpose: bool = False) -> np.ndarray:
-    """
-    CPU-only CTF load. Keep float32. Avoid double opens and float64.
-    """
-    with mrcfile.open(filepath, permissive=True) as m:
-        
-        # Ensure C-order float32
-        ctf = np.asarray(m.data, dtype=np.float32, order="C", copy=True)
-    if transpose:
-        ctf = np.transpose(ctf, (2, 1, 0))  # still a view when possible
-    # CTF is saved with DC at center → move to (0,0,0)
-    ctf = np.fft.ifftshift(ctf, axes=(0, 1, 2))
-    # Keep only the rfft half (last axis is frequency)
-    ctf = ctf[:, :, :101]
-    return ctf
-
 def load_ctf_relion5_cpu(filepath: str, transpose: bool = False) -> np.ndarray:
     """
     CPU-only CTF load. Keep float32. Avoid double opens and float64.
@@ -238,29 +249,29 @@ def load_ctf_relion5_cpu(filepath: str, transpose: bool = False) -> np.ndarray:
         ctf = np.asarray(ctf, dtype=np.float32, order="C")
     if transpose:
         ctf = np.transpose(ctf, (2, 1, 0))  # still a view when possible
-    # Keep only the rfft half (last axis is frequency)
-    
-    ctf = ctf[:int(ctf.shape[0]/2), :, :101]
+    # Keep only the rfft half: first N//2 slices in z, N//2+1 in x (last axis)
+    ctf = ctf[: ctf.shape[0] // 2, :, : ctf.shape[0] // 2 + 1]
     return ctf
 
 def join_data(star_path: str, workers: int = 1, config=None):
 
-    is_relion_old = config.relion_version != "relion5"
     pkl_prefix = _worker_pickle_prefix(config)
 
-    # Load base STAR data
-    df_base = starfile.read(star_path)
-    
-    df_base = df_base["particles"] if isinstance(df_base, dict) and "particles" in df_base else df_base
-    df_base = df_base[2] if isinstance(df_base, list) else df_base
+    # Load all STAR blocks in a single read
+    raw = starfile.read(star_path)
+    if isinstance(raw, dict):
+        df_base = raw.get("particles", list(raw.values())[-1])
+        optics   = raw.get("optics")
+        general  = raw.get("general")
+    elif isinstance(raw, list):
+        df_base  = raw[2] if len(raw) > 2 else raw[-1]
+        optics   = raw[1] if len(raw) > 1 else None
+        general  = raw[0] if len(raw) > 0 else None
+    else:
+        df_base = raw
+        optics = general = None
 
-    if not is_relion_old:
-        optics = starfile.read(star_path)
-    
-        optics = optics["optics"] if isinstance(optics, dict) and "optics" in optics else optics
-        optics = optics[1] if isinstance(optics, list) else optics
-    
-        pixel_size = optics["rlnImagePixelSize"].iloc[0]
+    pixel_size = optics["rlnImagePixelSize"].iloc[0]
 
     # Load all worker results
     parts = []
@@ -313,14 +324,9 @@ def join_data(star_path: str, workers: int = 1, config=None):
         mask = dfm["translation"].notna()
         if mask.any():
             shifts = np.stack(-1*dfm.loc[mask, "translation"].to_numpy())
-            if not is_relion_old:
-                dfm.loc[mask, "rlnOriginXAngst"] = shifts[:, 0] * pixel_size
-                dfm.loc[mask, "rlnOriginYAngst"] = shifts[:, 1] * pixel_size
-                dfm.loc[mask, "rlnOriginZAngst"] = shifts[:, 2] * pixel_size
-            else:
-                dfm.loc[mask, "rlnOriginX"] = shifts[:, 0]
-                dfm.loc[mask, "rlnOriginY"] = shifts[:, 1]
-                dfm.loc[mask, "rlnOriginZ"] = shifts[:, 2]
+            dfm.loc[mask, "rlnOriginXAngst"] = shifts[:, 0] * pixel_size
+            dfm.loc[mask, "rlnOriginYAngst"] = shifts[:, 1] * pixel_size
+            dfm.loc[mask, "rlnOriginZAngst"] = shifts[:, 2] * pixel_size
 
     if "alternation_index" in dfm.columns:
         final_alternation = int(config.get("num_alternations", 1)) - 1
@@ -348,103 +354,15 @@ def join_data(star_path: str, workers: int = 1, config=None):
         dfm = dfm.drop_duplicates(subset="_match_token")
     dfm = dfm.drop(columns=["_match_token"], errors="ignore")
 
-    if not is_relion_old:
-        starfile.write(
-            {"optics": optics, "particles": dfm},
-            f"{config.path_output}.star",
-            overwrite=True # required if the file already exists
-        )
-    else:
-        starfile.write(
-            dfm,
-            f"{config.path_output}.star",
-            overwrite=True # required if the file already exists
-        )
-    return True
-
-def join_data_relion_old(star_path: str, workers: int = 1, config=None):
-
-    assert config.relion_version != "relion5"
-    pkl_prefix = _worker_pickle_prefix(config)
-
-    # Load base STAR data
-    df_base = starfile.read(star_path)
-    
-    df_base = df_base["particles"] if isinstance(df_base, dict) and "particles" in df_base else df_base
-    df_base = df_base[2] if isinstance(df_base, list) else df_base
-
-
-    # Load all worker results
-    parts = []
-    for half_id in [1,2]:
-        for worker_id in range(workers):
-            file_name = f"{pkl_prefix}_half{half_id}_{worker_id}.pkl"
-            if Path(file_name).exists():
-                df = pd.read_pickle(file_name)
-                parts.append(df)
-            else:
-                print(f"Warning: {file_name} not found")
-    if not parts:
-        print("No worker files found.")
-        return False
-
-    df_result = pd.concat(parts, ignore_index=True)
-    df_base["rlnTomoParticleName"] = (
-        df_base["rlnImageName"]
-        .apply(lambda x: "".join(x.split("/")[-1]).replace("_subtomo", ""))
-    )
-
-    # --- clean join keys ---
-    df_base["rlnTomoParticleName"] = df_base["rlnTomoParticleName"].astype(str).str.strip()
-    df_result["rlnTomoParticleName"] = df_result["rlnTomoParticleName"].astype(str).str.strip()
-    # --- merge on the shared column ---
-    dfm = df_base.merge(
-        df_result,
-        on="rlnTomoParticleName",
-        how="left",
-        suffixes=("", "_res"),
-        indicator=True
-    )
-    dfm["fastAlignment"] = (dfm["_merge"] == "both").astype(np.int8)
-    dfm = dfm.drop(columns=["_merge"])
-
-    # --- compute eulers only for matching rows ---
-    if "rotation" in dfm.columns:
-        mask = dfm["rotation"].notna()
-        if mask.any():
-            rot_arr = np.stack(dfm.loc[mask, "rotation"].to_numpy())
-            eulers = R.from_euler("zyz", rot_arr, degrees=False).inv().as_euler("ZYZ", degrees=True)
-            dfm.loc[mask, ["rlnAnglePsi","rlnAngleTilt","rlnAngleRot"]] = eulers
-        else:
-            return False
-    else:
-        return False
-
-    if "translation" in dfm.columns:
-        mask = dfm["translation"].notna()
-        if mask.any():
-            shifts = np.stack(-1*dfm.loc[mask, "translation"].to_numpy())
-            dfm.loc[mask, "rlnOriginX"] = shifts[:, 0]
-            dfm.loc[mask, "rlnOriginY"] = shifts[:, 1]
-            dfm.loc[mask, "rlnOriginZ"] = shifts[:, 2]
-        else:
-            return False
-    else:
-        return False
-
-    if "alternation_index" in dfm.columns:
-        dfm = dfm[dfm["alternation_index"] == 2]
-    
-    # remove all columns from df_result
-    cols_to_remove = [col for col in df_result.columns if col != "rlnTomoParticleName"]
-    
-    dfm = dfm.drop(columns=cols_to_remove)
-    dfm = dfm.drop_duplicates(subset="rlnTomoParticleName")
-
-
+    out_blocks = {}
+    if general is not None:
+        out_blocks["general"] = general
+    if optics is not None:
+        out_blocks["optics"] = optics
+    out_blocks["particles"] = dfm
     starfile.write(
-        dfm,
+        out_blocks,
         f"{config.path_output}.star",
-        overwrite=True # required if the file already exists
+        overwrite=True,
     )
     return True

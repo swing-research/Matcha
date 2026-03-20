@@ -9,7 +9,8 @@ import time
 import json
 import argparse
 
-from utils.volume_ops import get_spherical_mask, normalise_torch
+from utils.volume_ops import get_spherical_mask, normalise
+from utils.setup_utils import resolve_precision_mode
 from utils.rotation_ops import sample_rotations_around, update_rotation_estimate
 from core.CrossCorrelationMatcher import CrossCorrelationMatcher
 from core.Matcha import Matcha
@@ -76,7 +77,7 @@ def timed_search_orientations(matcher, sigma, warmup_runs: int, timed_runs: int,
     return result, np.asarray(timings_ms, dtype=np.float64)
 
 
-def add_awgn_snr(image: torch.Tensor, snr_db, mask=None, clip: bool = True) -> torch.Tensor:
+def add_awgn(image: torch.Tensor, snr_db, mask=None, clip: bool = True) -> torch.Tensor:
     orig_dtype = image.dtype
     device = image.device
 
@@ -120,7 +121,7 @@ def add_awgn_snr(image: torch.Tensor, snr_db, mask=None, clip: bool = True) -> t
 
 
 def get_target_volumes(volume, mask, dtype, device, batchsize):
-    volume = normalise_torch(torch.from_numpy(volume.copy()).to(device = device, 
+    volume = normalise(torch.from_numpy(volume.copy()).to(device = device, 
                                                                 dtype=dtype), mask=mask) 
     volume = volume * mask
     return volume.unsqueeze(0).expand(batchsize, -1, -1, -1)
@@ -190,7 +191,7 @@ def run_alignment(config):
         )
 
         # add noise 
-        rotated_noisy_volumes = add_awgn_snr(
+        rotated_noisy_volumes = add_awgn(
             rotated_volumes,
             snr_db=config.example_config.snr_db,
             clip=False, 
@@ -318,7 +319,8 @@ def prepare_alignment_example(config):
     config.execution.Correlator = CrossCorrelationMatcher(
         N = config.N,
         device = device,
-        expansion_epsilon = float(config.expansion_epsilon),
+        expansion_epsilon = float(config.get("expansion_epsilon", 1e-4)),
+        precision_mode = resolve_precision_mode(config),
         batchsize = config.example_config.batchsize,
         reduce_memory = True,
         bandlimit = min(search_L_max + 1, 76),

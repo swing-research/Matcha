@@ -10,7 +10,7 @@ from ml_collections import ConfigDict
 
 
 @torch.jit.script
-def _mean_torch(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _mean(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Return masked mean; if mask is empty, return zero."""
     if mask.sum() == 0:
         return torch.tensor(0.0, device=vol.device, dtype=vol.dtype)
@@ -18,17 +18,17 @@ def _mean_torch(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 @torch.jit.script
-def _std_torch(vol: torch.Tensor, mask: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+def _std(vol: torch.Tensor, mask: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
     """Return masked standard deviation from a precomputed mean."""
-    return torch.sqrt(_mean_torch(vol**2, mask) - mean**2)
+    return torch.sqrt(_mean(vol**2, mask) - mean**2)
 
 
-def normalise_torch(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def normalise(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Normalize a volume using masked mean/std."""
     if mask.sum() == 0:
         return vol
-    mean = _mean_torch(vol, mask)
-    std = _std_torch(vol, mask, mean)
+    mean = _mean(vol, mask)
+    std = _std(vol, mask, mean)
     return (vol - mean) / std
 
 
@@ -43,7 +43,7 @@ def get_base_coords(shape: tuple, center: tuple, device: torch.device) -> torch.
     return torch.stack((X, Y, Z), dim=-1)
 
 
-def _upsampled_dft_torch(
+def _upsampled_dft(
     data: torch.Tensor,
     upsampled_region_size: torch.Tensor,
     upsample_factor: float = 1.0,
@@ -100,6 +100,7 @@ def compute_shift(
     score_normalization: bool = False,
     max_shift: torch.Tensor = None,
     mode: str = "local",
+    search_window_size: int = 5,
 ):
     """Estimate translation between reference and moving volumes.
 
@@ -138,6 +139,11 @@ def compute_shift(
     ------
     ValueError
         If batch sizes are incompatible or if ``mode`` is unsupported.
+
+    Notes
+    -----
+    Adapted from the scikit-image phase cross-correlation implementation:
+    https://github.com/scikit-image/scikit-image/blob/main/src/skimage/registration/_phase_cross_correlation.py
     """
     assert moving_image.ndim >= 3 and moving_image.ndim <= 4
 
@@ -196,8 +202,7 @@ def compute_shift(
     midpoint = torch.floor(shape / 2)[None, :]
     shift = maxima.to(torch.float32)
     shift = torch.where(shift > midpoint, shift - shape, shift)
-
-    if max_shift is not None:
+    if max_shift is not None and mode == "global":
         over = (shift.abs() > max_shift).any(dim=1)
         batch_ids = torch.where(over)[0]
         if batch_ids.numel() > 0:
@@ -240,12 +245,12 @@ def compute_shift(
             shift = shift * 0.0
         upsample_factor_tensor = torch.tensor(upsample_factor, dtype=float_dtype, device=abs_corr.device)
         shift = torch.round(shift * upsample_factor_tensor) / upsample_factor_tensor
-        upsampled_region_size = torch.ceil(upsample_factor_tensor * 5).to(torch.int64)
+        upsampled_region_size = torch.ceil(upsample_factor_tensor * search_window_size).to(torch.int64)
 
         dftshift = torch.floor(upsampled_region_size.to(float_dtype) / 2.0)
         sample_region_offset = dftshift - shift * upsample_factor_tensor
 
-        refined_cc = _upsampled_dft_torch(
+        refined_cc = _upsampled_dft(
             image_product.conj(),
             upsampled_region_size,
             upsample_factor=upsample_factor,
@@ -285,6 +290,7 @@ def compute_shift_local(
     normalization: str = "phase",
     score_normalization: bool = False,
     max_shift: torch.Tensor = None,
+    search_window_size: int = 5,
 ):
     """Estimate shifts using local (legacy) refinement.
 
@@ -319,6 +325,7 @@ def compute_shift_local(
         score_normalization=score_normalization,
         max_shift=max_shift,
         mode="local",
+        search_window_size=search_window_size,
     )
 
 
@@ -548,7 +555,7 @@ def apply_cosine_mask(vol, mask_outer, mask_cosine, raisedcos):
     return vol
 
 
-def extract_patch_torch_batch(
+def extract_shifted_patch_batch(
     volume: torch.Tensor,
     shift: torch.Tensor,
     config: ConfigDict,
@@ -603,7 +610,7 @@ def extract_patch_torch_batch(
                         patch[tuple(idx)] = 0
 
             if normalize:
-                patch = normalise_torch(patch, config["execution"]["spherical_mask_torch"]) * config["execution"]["spherical_mask_torch"]
+                patch = normalise(patch, config["execution"]["spherical_mask_torch"]) * config["execution"]["spherical_mask_torch"]
             batched_tomogram_data[b, s] = patch
 
     return batched_tomogram_data.view(-1, *config["execution"]["shape"])
@@ -620,16 +627,17 @@ def estimate_shift_like_relion(
     mask_cosine,
     raisedcos,
     config,
-    upsample_factor,
 ):
     """Estimate local shifts using the RELION-style masked correlation pipeline."""
-    _ = ctfs  # kept for API compatibility
     rotated_reference = rotate_complex_volume(reference_data_fourier, angles, pad_for_rfft_slicing=True)
     rotated_reference = rotated_reference[:, :, :, int(config.N // 2) :]
 
     rotated_reference = torch.fft.ifftshift(rotated_reference, dim=(1, 2)) * mask_full
 
-    shifted_subtomos = extract_patch_torch_batch(
+    if bool(config.get("do_ctf_correction", True)) and ctfs is not None:
+        rotated_reference = rotated_reference * ctfs
+
+    shifted_subtomos = extract_shifted_patch_batch(
         subtomos,
         torch.flip(shift_zyx, dims=[-1]),
         config,
@@ -647,14 +655,19 @@ def estimate_shift_like_relion(
         dim=(1, 2, 3),
     )
 
+    upsample_factor = int(config.get("shift_upsample_factor", 16))
+    radius = int(config.get("shift_search_radius", 2))
+    window = 2 * radius + 1  # always odd; center pixel = zero shift
+
     local_shift, _, max_corr = compute_shift_local(
         rotated_reference,
         subtomo_rffts,
-        upsample_factor=16,  # keep fixed value for parity with prior behavior
+        upsample_factor=upsample_factor,
         space="complex",
         normalization=None,
         score_normalization=True,
-        max_shift=torch.tensor(8, device=rotated_reference.device),
+        max_shift=torch.tensor(radius, device=rotated_reference.device),
+        search_window_size=window,
     )
 
     total_shift = torch.flip(local_shift, dims=[-1])
@@ -674,7 +687,6 @@ def estimate_shift(
     mask_cosine,
     raisedcos,
     config,
-    upsample_factor,
     micro_batch_size: int = 10,
     device=None,
 ):
@@ -696,9 +708,6 @@ def estimate_shift(
         Masks used in RELION-style shift scoring.
     config : ConfigDict
         Runtime configuration with volume/mask settings.
-    upsample_factor : int
-        Requested upsampling factor (the inner RELION-like call currently uses
-        its fixed parity-preserving behavior).
     micro_batch_size : int, default=10
         Batch size for chunked processing to control memory usage.
     device : torch.device or None, default=None
@@ -744,7 +753,6 @@ def estimate_shift(
             mask_cosine=mask_cosine,
             raisedcos=raisedcos,
             config=config,
-            upsample_factor=upsample_factor,
         )
 
         est_list.append(shift_estimate_mb.detach() if shift_estimate_mb.requires_grad else shift_estimate_mb)
@@ -870,7 +878,6 @@ class ShiftMatcher:
         ctfs: torch.Tensor,
         shift_zyx: torch.Tensor,
         rotation_tracker,
-        upsample_factor: int,
         micro_batch_size: int = None,
     ):
         """Estimate shifts for a batch at current orientation estimates.
@@ -885,8 +892,6 @@ class ShiftMatcher:
             Current shift estimates in ``(z, y, x)`` order.
         rotation_tracker : quaternionic.array-like
             Current cumulative rotation estimate per particle/grid candidate.
-        upsample_factor : int
-            Shift refinement upsampling factor argument.
         micro_batch_size : int or None, default=None
             Optional override for chunk size during shift estimation.
 
@@ -917,7 +922,6 @@ class ShiftMatcher:
             mask_cosine=self.config.execution.mask_cosine,
             raisedcos=self.config.execution.raisedcos,
             config=self.config,
-            upsample_factor=upsample_factor,
             micro_batch_size=(
                 int(micro_batch_size) if micro_batch_size is not None else self.micro_batch_size
             ),

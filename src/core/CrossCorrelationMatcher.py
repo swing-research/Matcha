@@ -3,7 +3,7 @@ import spherical
 import torch
 import torch.nn.functional as F
 
-from utils.volume_ops import normalise_torch
+from utils.volume_ops import normalise
 from utils.setup_utils import compute_size
 from core.FLEBasis3D import FLEBasis3D
 
@@ -16,7 +16,7 @@ def _to_complex(dtype):
     else:
         raise ValueError(f"Unsupported dtype {dtype} for conversion to complex.")
 
-def getSHT_Index(m : int):
+def get_sht_index(m : int):
     """
     Get the Spherical Harmonics Transform (SHT) index for a given order m.
     Parameters:
@@ -53,7 +53,7 @@ class CrossCorrelationMatcher():
             radius: int = None,
             jl_zeros_path: str = None,
             cs_path: str = None,
-            
+            precision_mode: str = "accurate",
     ):
         """
         Initialize the CrossCorrelationMatcher with the given arguments.
@@ -96,6 +96,7 @@ class CrossCorrelationMatcher():
             dtype = self.dtype,
             jl_zeros_path = jl_zeros_path,
             cs_path = cs_path,
+            precision_mode = precision_mode,
         )
     
         # Store maximum degree lmax
@@ -124,7 +125,7 @@ class CrossCorrelationMatcher():
         template_data = torch.from_numpy(template_data.copy()).to(dtype=self.dtype_real, device=self.device) # shape (N, N, N)
         #template_data = normalise_torch(template_data, mask=mask) * mask if mask is not None else template_data
 
-        bh_template = self.fle.evaluate_t_torch(template_data.unsqueeze(0))[0] # shape (ne)
+        bh_template = self.fle.evaluate_t(template_data.unsqueeze(0))[0] # shape (ne)
         self.template_coefficients_alphas_torch =  F.pad(bh_template, (0, 1)) # pad with one zero entry for the last index
         self.bh_norm_template = torch.linalg.norm(bh_template) # norm over ne dimension
 
@@ -149,12 +150,12 @@ class CrossCorrelationMatcher():
             
             # Loop over m and mp to gather indices and phases
             for m in range(-l, l + 1):
-                alpha1_id = self.fle.idlm_list[l][getSHT_Index(-m)]
+                alpha1_id = self.fle.idlm_list[l][get_sht_index(-m)]
                 max_len_l = max(max_len_l, len(alpha1_id))
                 alpha1_l.append(alpha1_id)
 
             for mp in range(-l, l + 1):
-                alpha2_id = self.fle.idlm_list[l][getSHT_Index(-mp)]
+                alpha2_id = self.fle.idlm_list[l][get_sht_index(-mp)]
                 max_len_l = max(max_len_l, len(alpha2_id))
                 alpha2_l.append(alpha2_id)
 
@@ -237,7 +238,7 @@ class CrossCorrelationMatcher():
             batch_volumes = volumes[i:i_to]
 
             # Compute ball harmonics expansion for the current micro-batch
-            bh_volumes = self.fle.evaluate_t_torch(batch_volumes) 
+            bh_volumes = self.fle.evaluate_t(batch_volumes) 
 
             # Compute norms of the ball harmonics volumes
             self.bh_norms[i:i_to] = torch.linalg.norm(bh_volumes, dim=1)
