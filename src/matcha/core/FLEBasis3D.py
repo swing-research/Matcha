@@ -19,7 +19,7 @@ import torch
 from scipy.io import loadmat
 import torch.nn.functional as F
 
-from core.DCT import dct, idct
+from matcha.core.DCT import dct, idct
 
 class FLEBasis3D:
     #

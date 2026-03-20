@@ -1,35 +1,48 @@
-import torch
-import numpy as np
-import mrcfile
-import os
-import yaml
-import ml_collections
-import quaternionic
-import time
-import json
+from __future__ import annotations
+
 import argparse
+import json
+import time
 
-from utils.volume_ops import get_spherical_mask, normalise
-from utils.setup_utils import resolve_precision_mode
-from utils.rotation_ops import sample_rotations_around, update_rotation_estimate
-from core.CrossCorrelationMatcher import CrossCorrelationMatcher
-from core.Matcha import Matcha
-from core.SOFFT import SOFFT
-from utils.volume_rotation import rotate_volumes
-import warnings
+_RUNTIME_LOADED = False
 
-# Avoid displaying numba performance warnings
-from numba.core.errors import NumbaPerformanceWarning
-warnings.filterwarnings(
-    "ignore",
-    category=NumbaPerformanceWarning,
-)
+
+def _load_runtime_dependencies() -> None:
+    global _RUNTIME_LOADED
+    global CrossCorrelationMatcher, Matcha, SOFFT
+    global get_spherical_mask, mrcfile, ml_collections, normalise
+    global np, quaternionic, resolve_precision_mode, rotate_volumes
+    global sample_rotations_around, torch, update_rotation_estimate, yaml
+
+    if _RUNTIME_LOADED:
+        return
+
+    import warnings
+
+    import mrcfile
+    import ml_collections
+    import numpy as np
+    import quaternionic
+    import torch
+    import yaml
+    from numba.core.errors import NumbaPerformanceWarning
+
+    from matcha.core.CrossCorrelationMatcher import CrossCorrelationMatcher
+    from matcha.core.Matcha import Matcha
+    from matcha.core.SOFFT import SOFFT
+    from matcha.utils.rotation_ops import sample_rotations_around, update_rotation_estimate
+    from matcha.utils.setup_utils import resolve_precision_mode
+    from matcha.utils.volume_ops import get_spherical_mask, normalise
+    from matcha.utils.volume_rotation import rotate_volumes
+
+    warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
+    _RUNTIME_LOADED = True
 
 
 class SOFFTMatcher:
     """Lightweight wrapper to expose a Matcha-like `search_orientations` API."""
 
-    def __init__(self, batchsize: int, device: torch.device, L_max: int, oversampling_factor_K: int = 2):
+    def __init__(self, batchsize: int, device, L_max: int, oversampling_factor_K: int = 2):
         self.sofft = SOFFT(
             L=L_max,
             device=device,
@@ -37,7 +50,7 @@ class SOFFTMatcher:
             oversampling_factor=oversampling_factor_K,
         )
 
-    def search_orientations(self, sigma: torch.Tensor):
+    def search_orientations(self, sigma):
         grid_scores = self.sofft.eval(sigma)
         batchsize, num_betas, num_alphas, num_gammas = grid_scores.shape
 
@@ -54,7 +67,7 @@ class SOFFTMatcher:
         return alphas.squeeze(1), betas.squeeze(1), gammas.squeeze(1), best_scores
 
 
-def timed_search_orientations(matcher, sigma, warmup_runs: int, timed_runs: int, device: torch.device):
+def timed_search_orientations(matcher, sigma, warmup_runs: int, timed_runs: int, device):
     warmup_runs = max(0, int(warmup_runs))
     timed_runs = max(1, int(timed_runs))
 
@@ -77,38 +90,29 @@ def timed_search_orientations(matcher, sigma, warmup_runs: int, timed_runs: int,
     return result, np.asarray(timings_ms, dtype=np.float64)
 
 
-def add_awgn(image: torch.Tensor, snr_db, mask=None, clip: bool = True) -> torch.Tensor:
+def add_awgn(image, snr_db, mask=None, clip: bool = True):
     orig_dtype = image.dtype
     device = image.device
 
     img = image.to(torch.float32)
-    B = img.shape[0]
+    batch_size = img.shape[0]
 
     if mask is not None:
-        # (D,H,W) mask -> expand to (B,D,H,W)
         mask = mask.to(torch.bool)
-        mask_b = mask.expand(B, *mask.shape)
-        # Extract masked voxels for each sample
-        signal_vals = img[mask_b].view(B, -1)
+        mask_b = mask.expand(batch_size, *mask.shape)
+        signal_vals = img[mask_b].view(batch_size, -1)
     else:
-        signal_vals = img.view(B, -1)
+        signal_vals = img.view(batch_size, -1)
 
-    # Signal power (mean squared per sample)
     signal_power = (signal_vals ** 2).mean(dim=1)
-
-    # Desired SNR
     snr_db_t = torch.as_tensor(snr_db, dtype=img.dtype, device=device)
     snr_linear = 10.0 ** (snr_db_t / 10.0)
-
-    # Noise power per sample
     noise_power = signal_power / snr_linear
-    noise_std = torch.sqrt(noise_power).view(B, *([1] * (img.ndim - 1)))
+    noise_std = torch.sqrt(noise_power).view(batch_size, *([1] * (img.ndim - 1)))
 
-    # Gaussian noise
     noise = torch.randn_like(img) * noise_std
     noisy = img + noise
 
-    # Restore dtype
     if orig_dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         if clip:
             info = torch.iinfo(orig_dtype)
@@ -121,16 +125,14 @@ def add_awgn(image: torch.Tensor, snr_db, mask=None, clip: bool = True) -> torch
 
 
 def get_target_volumes(volume, mask, dtype, device, batchsize):
-    volume = normalise(torch.from_numpy(volume.copy()).to(device = device, 
-                                                                dtype=dtype), mask=mask) 
+    volume = normalise(torch.from_numpy(volume.copy()).to(device=device, dtype=dtype), mask=mask)
     volume = volume * mask
     return volume.unsqueeze(0).expand(batchsize, -1, -1, -1)
-    
+
 
 def run_alignment(config):
-    # GPU available
     device = torch.device("cuda:0")
-    seed = config.random_seed
+    seed = int(config.get("random_seed", 0))
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -142,38 +144,30 @@ def run_alignment(config):
     print_per_batch = bool(timing_cfg.print_per_batch)
     search_timings_ms = []
 
-    # Set template data
     with mrcfile.open(config["path_template"]) as mrc:
         volume = mrc.data.copy()
-    config.execution.Correlator.set_template(volume,config.execution["spherical_mask_torch"])
+    config.execution.Correlator.set_template(volume, config.execution["spherical_mask_torch"])
 
-    # sample target rotations once
     rotation_samples = sample_rotations_around(
-                    base_quat=quaternionic.array([1, 0, 0, 0]),
-                    n_samples=number_subtomograms,
-                    max_angle=180.0,
-                )
+        base_quat=quaternionic.array([1, 0, 0, 0]),
+        n_samples=number_subtomograms,
+        max_angle=180.0,
+    )
 
-    # create mask and move to device
-    mask = get_spherical_mask(
-        (config.N, config.N, config.N),
-        radius=config.example_config.masking_radius
-        )
+    mask = get_spherical_mask((config.N, config.N, config.N), radius=config.example_config.masking_radius)
     mask = torch.from_numpy(mask).to(device=device, dtype=config.execution["dtype_real"])
-    
-    # load target volumes
+
     target_volumes = get_target_volumes(
-        volume = volume, 
-        mask = mask, 
-        dtype = config.execution["dtype_real"], 
-        device = device,
-        batchsize = batchsize)
+        volume=volume,
+        mask=mask,
+        dtype=config.execution["dtype_real"],
+        device=device,
+        batchsize=batchsize,
+    )
 
     dists = []
     for batch_iter in range(0, number_subtomograms, batchsize):
-
-        # get rotations for the batch
-        rotations_batch = rotation_samples[batch_iter: batch_iter + batchsize]
+        rotations_batch = rotation_samples[batch_iter : batch_iter + batchsize]
         current_batch = len(rotations_batch)
         if current_batch < batchsize:
             rotations_np = np.array(rotations_batch)
@@ -182,25 +176,21 @@ def run_alignment(config):
         else:
             rotations = rotations_batch
 
-        # rotate volumes
         rotated_volumes = rotate_volumes(
-                        target_volumes.clone(),
-                        rotations,
-                        microbatch_size=10,  # adjust based on your GPU memory
-                        permute_before_sample=False
+            target_volumes.clone(),
+            rotations,
+            microbatch_size=10,
+            permute_before_sample=False,
         )
 
-        # add noise 
         rotated_noisy_volumes = add_awgn(
             rotated_volumes,
             snr_db=config.example_config.snr_db,
-            clip=False, 
-            mask=mask)
-        
-        # Compute correlation Coefficients \sigma_l,m,m'
+            clip=False,
+            mask=mask,
+        )
+
         sigma, _ = config.execution.Correlator.get_sigma(rotated_noisy_volumes)
-        
-        # search for rotation parameters (timed)
         (alphas, betas, gammas, _), batch_times = timed_search_orientations(
             matcher=config.execution.Matcher,
             sigma=sigma,
@@ -214,13 +204,12 @@ def run_alignment(config):
                 f"[batch {batch_iter // batchsize:03d}] search_orientations "
                 f"avg={batch_times.mean():.2f} ms over {timed_runs} timed run(s)"
             )
-        
-        # update rotation estimates
+
         rotations, _ = update_rotation_estimate(
-            alphas = alphas, 
-            betas = betas, 
-            gammas = gammas, 
-            rotation_tracker= rotations
+            alphas=alphas,
+            betas=betas,
+            gammas=gammas,
+            rotation_tracker=rotations,
         )
 
         batch_dists = np.rad2deg(
@@ -230,7 +219,7 @@ def run_alignment(config):
             )
         )
         dists.append(np.asarray(batch_dists)[:current_batch])
-    
+
     dists = np.concatenate(dists, axis=0)
     search_timings_ms = np.asarray(search_timings_ms, dtype=np.float64)
     mean_dist = float(np.mean(dists))
@@ -243,14 +232,14 @@ def run_alignment(config):
     total_search_ms = mean_search_ms * num_batches
     search_method = str(config.orientation_search.method).lower()
     if search_method == "sofft":
-        search_L_max = int(config.sofft_config.L_max)
+        search_l_max = int(config.sofft_config.L_max)
     else:
-        search_L_max = int(config.example_config.L_max)
+        search_l_max = int(config.example_config.L_max)
 
     print(f"Results of {number_subtomograms} volumes at snr {config.example_config.snr_db}dB:")
-    print(f"Mean distance (deg): {mean_dist:.2f}°")
-    print(f"Median distance (deg): {median_dist:.2f}°")
-    print(f"90th percentile distance (deg): {p90_dist:.2f}°")
+    print(f"Mean distance (deg): {mean_dist:.2f} deg")
+    print(f"Median distance (deg): {median_dist:.2f} deg")
+    print(f"90th percentile distance (deg): {p90_dist:.2f} deg")
     print(
         "search_orientations timing: "
         f"mean={mean_search_ms:.2f} ms, "
@@ -275,38 +264,36 @@ def run_alignment(config):
         "batchsize": int(batchsize),
         "snr_db": float(config.example_config.snr_db),
         "search_method": str(config.orientation_search.method),
-        "search_L_max": search_L_max,
+        "search_L_max": search_l_max,
     }
+
 
 def prepare_alignment_example(config):
     assert torch.cuda.is_available(), "CUDA is not available. Please run on a machine with a CUDA-capable GPU."
     device = torch.device("cuda:0")
 
-    # Set execution parameters
     config.execution = ml_collections.ConfigDict()
     config.execution["dtype_real"] = torch.float32
     config.execution["spherical_mask_torch"] = torch.from_numpy(
-        get_spherical_mask(
-            (config.N, config.N, config.N),
-            radius=config.example_config.masking_radius
-        )).to(device=device, dtype=config.execution["dtype_real"])
+        get_spherical_mask((config.N, config.N, config.N), radius=config.example_config.masking_radius)
+    ).to(device=device, dtype=config.execution["dtype_real"])
 
     search_method = config.orientation_search.method.lower()
     if search_method == "matcha":
-        search_L_max = int(config.example_config.L_max)
+        search_l_max = int(config.example_config.L_max)
         config.execution.Matcher = Matcha(
             batchsize=config.example_config.batchsize,
             device=device,
-            L_max=search_L_max,
+            L_max=search_l_max,
             matcha_config=config.matcha_config,
         )
     elif search_method == "sofft":
         sofft_cfg = config.sofft_config
-        search_L_max = int(sofft_cfg.L_max)
+        search_l_max = int(sofft_cfg.L_max)
         config.execution.Matcher = SOFFTMatcher(
             batchsize=config.example_config.batchsize,
             device=device,
-            L_max=search_L_max,
+            L_max=search_l_max,
             oversampling_factor_K=int(sofft_cfg.oversampling_factor_K),
         )
     else:
@@ -315,38 +302,47 @@ def prepare_alignment_example(config):
             "Use 'matcha' or 'sofft'."
         )
 
-    # Initialize CrossCorrelationMatcher
     config.execution.Correlator = CrossCorrelationMatcher(
-        N = config.N,
-        device = device,
-        expansion_epsilon = float(config.get("expansion_epsilon", 1e-4)),
-        precision_mode = resolve_precision_mode(config),
-        batchsize = config.example_config.batchsize,
-        reduce_memory = True,
-        bandlimit = min(search_L_max + 1, 76),
-        micro_batch_split = 2, 
-        dtype = torch.float32,
-        radius = config.example_config.masking_radius,
-        jl_zeros_path = config["jl_zeros_path"],
-        cs_path = config["cs_path"]
+        N=config.N,
+        device=device,
+        expansion_epsilon=float(config.get("expansion_epsilon", 1e-4)),
+        precision_mode=resolve_precision_mode(config),
+        batchsize=config.example_config.batchsize,
+        reduce_memory=True,
+        bandlimit=min(search_l_max + 1, 76),
+        micro_batch_split=2,
+        dtype=torch.float32,
+        radius=config.example_config.masking_radius,
+        jl_zeros_path=config["jl_zeros_path"],
+        cs_path=config["cs_path"],
     )
-    
+
+
+def _resolve_example_runtime_config(config, config_path: str) -> None:
+    from matcha.run import _read_template_meta, _resolve_lookup_table_paths, _resolve_resource_path
+
+    _resolve_lookup_table_paths(config=config, config_path=config_path)
+    template_path = _resolve_resource_path(config["path_template"], config_path=config_path)
+    template_n, template_voxel_size = _read_template_meta(template_path)
+    config["path_template"] = template_path
+    config["N"] = int(template_n)
+    config["voxel_size"] = float(template_voxel_size)
+    if "random_seed" not in config:
+        config["random_seed"] = 0
+
+
 def main(config):
-
-    # Prepare alignment
+    _load_runtime_dependencies()
     prepare_alignment_example(config)
-
     return run_alignment(config)
 
 
 def cli(argv=None):
-    parser = argparse.ArgumentParser(description="Run example alignment benchmark.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=os.path.join("configs", "config_example.yaml"),
-        help="Path to YAML config file.",
+    parser = argparse.ArgumentParser(
+        description="Run the Matcha orientation-search benchmark.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--config", type=str, default="config_example.yaml", help="Path to YAML config file.")
     parser.add_argument(
         "--metrics_out",
         type=str,
@@ -355,10 +351,14 @@ def cli(argv=None):
     )
     args = parser.parse_args(argv)
 
-    with open(args.config, encoding="utf-8") as cf_file:
+    _load_runtime_dependencies()
+    from matcha.run import _resolve_config_path
+
+    config_path = _resolve_config_path(args.config)
+    with open(config_path, encoding="utf-8") as cf_file:
         config_yaml = yaml.safe_load(cf_file.read())
     config = ml_collections.ConfigDict(config_yaml, type_safe=True)
-
+    _resolve_example_runtime_config(config=config, config_path=config_path)
 
     config.execution = ml_collections.ConfigDict()
     metrics = main(config)

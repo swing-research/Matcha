@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.so
+*.npz 
+
+.build/
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+
+outputs/
+tmp/
+results.json
+
+.DS_Store
+
+# Downloaded example volume
+src/matcha/data/*.mrc

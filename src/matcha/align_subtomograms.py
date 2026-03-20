@@ -5,13 +5,13 @@ import starfile
 import torch
 from ml_collections import ConfigDict
 
-from core.CrossCorrelationMatcher import CrossCorrelationMatcher
-from core.Matcha import Matcha
-from core.ShiftMatcher import ShiftMatcher
-from utils.io_utils import extract_subtomogram_patch_batch, load_template, mask_effective_radius, store_alignment_parameters
-from utils.rotation_ops import update_rotation_estimate
-from utils.setup_utils import get_prior_shifts, get_rotation_tracker, pad_data, set_random_seed, setup_mask, resolve_precision_mode
-from utils.volume_rotation import rotate_volumes
+from matcha.core.CrossCorrelationMatcher import CrossCorrelationMatcher
+from matcha.core.Matcha import Matcha
+from matcha.core.ShiftMatcher import ShiftMatcher
+from matcha.utils.io_utils import extract_subtomogram_patch_batch, load_template, mask_effective_radius, store_alignment_parameters
+from matcha.utils.rotation_ops import update_rotation_estimate
+from matcha.utils.setup_utils import get_prior_shifts, get_rotation_tracker, pad_data, set_random_seed, setup_mask, resolve_precision_mode
+from matcha.utils.volume_rotation import rotate_volumes
 import warnings
 
 # Avoid displaying numba performance warnings

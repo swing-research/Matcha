@@ -8,7 +8,7 @@ from ml_collections import ConfigDict
 import starfile 
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
-from utils.volume_ops import normalise
+from matcha.utils.volume_ops import normalise
 
 
 def _particle_token(path_like: str) -> str:

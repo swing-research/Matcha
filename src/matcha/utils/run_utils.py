@@ -1,3 +1,4 @@
+import gc
 import torch, torch.multiprocessing as mp
 import numpy as np
 import threading
@@ -16,8 +17,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
-from utils.setup_utils import get_subtomogram_paths_from_particles, setup_data_splits
-from utils.io_utils import load_subtomogram_cpu, load_ctf_relion5_cpu, join_data
+from matcha.utils.setup_utils import get_subtomogram_paths_from_particles, setup_data_splits
+from matcha.utils.io_utils import load_subtomogram_cpu, load_ctf_relion5_cpu, join_data
 
 def _read_worker(p:str, ctf_loader, base_str:str, replace_str:str):
     """Thread worker: load one subtomogram + its CTF with error capture.
@@ -144,7 +145,7 @@ def worker_entry(config: ConfigDict, queue:mp.Queue, stop_event=None):
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    from align_subtomograms import align  # must be top-level import
+    from matcha.align_subtomograms import align
 
     try:
         align(config, queue)
@@ -158,6 +159,214 @@ def worker_entry(config: ConfigDict, queue:mp.Queue, stop_event=None):
             print("[ERROR] Try lowering 'auto_batch_safety' in config.yaml.", flush=True)
             sys.exit(2)  # distinct exit code for OOM
         raise
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    """Return True for PyTorch and CUDA-driver OOM variants."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda_error_out_of_memory" in msg
+        or "cudamemoryerror" in msg
+        or "cumemalloc" in msg
+    )
+
+
+def _round_batch_size_for_config(config: ConfigDict, batch_size: int) -> int:
+    """Round down to a valid multiple of micro_batch_split."""
+    micro_batch_split = max(1, int(config.get("micro_batch_split", 2)))
+    batch_size = max(micro_batch_split, int(batch_size))
+    return max(micro_batch_split, (batch_size // micro_batch_split) * micro_batch_split)
+
+
+def _probe_batch_size_impl(config_dict: dict, probe_path: str, batch_size: int) -> dict:
+    """Run one dry-run GPU probe and report whether the candidate batch size is safe."""
+    from matcha.align_subtomograms import AlignmentJob
+    from matcha.utils.io_utils import extract_subtomogram_patch_batch
+    from matcha.utils.rotation_ops import update_rotation_estimate
+    from matcha.utils.setup_utils import get_prior_shifts, get_rotation_tracker
+    from matcha.utils.volume_rotation import rotate_volumes
+
+    config = ConfigDict(copy.deepcopy(config_dict))
+    batch_size = _round_batch_size_for_config(config, batch_size)
+    probe_gpu_id = config.gpu_ids[0]
+    probe_device = torch.device(f"cuda:{int(probe_gpu_id)}")
+    safety = float(config.get("auto_batch_safety", 0.80))
+
+    torch.cuda.set_device(probe_device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(probe_device)
+    torch.cuda.reset_peak_memory_stats()
+
+    free_start, total = torch.cuda.mem_get_info(probe_device)
+    reserve_target = free_start * max(0.0, 1.0 - safety)
+    min_free = free_start
+    min_stage = "start"
+    stage = "runtime_init"
+
+    def _mark(label: str):
+        nonlocal min_free, min_stage
+        torch.cuda.synchronize(probe_device)
+        free_now, _ = torch.cuda.mem_get_info(probe_device)
+        if free_now < min_free:
+            min_free = free_now
+            min_stage = label
+
+    job = runtime = subtomos = ctfs = subtomograms = current_shift = None
+    base_shifts = local_shifts = prior_shifts = coeffs = bh_norms = None
+    rotation_score = shift_estimate = shift_scores = None
+    batched_data = None
+    rotation_tracker = None
+    alphas = betas = gammas = None
+    try:
+        probe_dict = config.to_dict()
+        probe_dict["gpu_id"] = probe_gpu_id
+        probe_dict["num_subtomograms_per_batch"] = batch_size
+        probe_config = ConfigDict(probe_dict)
+
+        job = AlignmentJob(input_config=probe_config, in_queue=None)
+        runtime = job.runtime_config
+        _mark("runtime_init")
+
+        N = int(runtime.N)
+        dtype_r = runtime.execution.dtype_real
+        probe_template = np.zeros((N, N, N), dtype=np.float32)
+
+        stage = "template_setup"
+        runtime.execution.Correlator.set_template(probe_template)
+        runtime.execution.ShiftMatcher.set_reference(probe_template)
+        _mark("template_setup")
+
+        stage = "input_alloc"
+        subtomos = torch.zeros(batch_size, N, N, N, device=probe_device, dtype=dtype_r)
+        ctfs = (
+            torch.zeros(batch_size, N, N, N // 2 + 1, device=probe_device, dtype=dtype_r)
+            if bool(probe_config.get("do_ctf_correction", True))
+            else None
+        )
+        _mark("input_alloc")
+
+        tomogram_file_names = [probe_path] * batch_size
+        base_shifts = runtime.execution.ShiftMatcher.get_base_shifts(
+            num_subtomograms_per_batch=batch_size,
+            num_base_shifts=1,
+            dtype_real=dtype_r,
+        )
+        rotation_tracker = get_rotation_tracker(
+            tomogram_file_names=tomogram_file_names,
+            df=job.df,
+            config=runtime,
+        )
+        prior_shifts = get_prior_shifts(
+            subtomograms=None,
+            tomogram_file_names=tomogram_file_names,
+            df=job.df,
+            config=runtime,
+        )
+        local_shifts = prior_shifts.clone()
+        prior_shifts.zero_()
+        _mark("tracker_setup")
+
+        stage = "clone"
+        subtomograms = subtomos.clone()
+        _mark("clone")
+
+        stage = "extract_rotate"
+        current_shift = prior_shifts + base_shifts + local_shifts
+        batched_data = extract_subtomogram_patch_batch(
+            volume=subtomograms,
+            shift=current_shift,
+            config=runtime,
+            normalize=False,
+        )
+        batched_data = rotate_volumes(
+            batched_data,
+            rotation_tracker,
+            microbatch_size=max(1, batch_size // 2),
+            permute_before_sample=False,
+        )
+        _mark("extract_rotate")
+
+        stage = "rotation_search"
+        coeffs, bh_norms = runtime.execution.Correlator.get_sigma(batched_data)
+        del batched_data
+        batched_data = None
+        alphas, betas, gammas, rotation_score = runtime.execution.RotationMatcher.search_orientations(
+            sigma=coeffs,
+        )
+        rotation_tracker, _ = update_rotation_estimate(
+            alphas=alphas.reshape(-1),
+            betas=betas.reshape(-1),
+            gammas=gammas.reshape(-1),
+            rotation_tracker=rotation_tracker,
+        )
+        _mark("rotation_search")
+
+        stage = "shift_search"
+        shift_estimate, shift_scores = runtime.execution.ShiftMatcher.search_shifts(
+            subtomos=subtomos,
+            ctfs=ctfs,
+            shift_zyx=current_shift,
+            rotation_tracker=rotation_tracker,
+        )
+        local_shifts += shift_estimate.unsqueeze(1)
+        _mark("shift_search")
+
+        safe = min_free >= reserve_target
+        return {
+            "batch_size": batch_size,
+            "safe": safe,
+            "oom": False,
+            "probe_error": False,
+            "stage": min_stage,
+            "min_free": min_free,
+            "reserve_target": reserve_target,
+            "free_start": free_start,
+            "total": total,
+            "peak_reserved": torch.cuda.max_memory_reserved(),
+        }
+    except Exception as exc:
+        return {
+            "batch_size": batch_size,
+            "safe": False,
+            "oom": _is_cuda_oom_error(exc),
+            "probe_error": True,
+            "stage": stage,
+            "min_free": min_free,
+            "reserve_target": reserve_target,
+            "free_start": free_start,
+            "total": total,
+            "error": str(exc).splitlines()[0],
+        }
+    finally:
+        del job, runtime, subtomos, ctfs, subtomograms
+        del current_shift, base_shifts, local_shifts, prior_shifts
+        del coeffs, bh_norms, rotation_score, shift_estimate, shift_scores, batched_data
+        del rotation_tracker, alphas, betas, gammas
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(probe_device)
+        except Exception:
+            pass
+
+
+def _probe_batch_size_worker(config_dict: dict, probe_path: str, batch_size: int, conn) -> None:
+    """Run a probe in a child process so CUDA failures do not poison the parent context."""
+    result = _probe_batch_size_impl(config_dict, probe_path, batch_size)
+    try:
+        conn.send(result)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 class AlignmentRunJob:
@@ -444,22 +653,29 @@ class AlignmentRunJob:
             f"max_inflight={self.reader_max_inflight}"
         )
 
-    def _find_batch_size(self) -> int:
-        """Probe GPU peak memory with a real forward pass, then extrapolate.
+    def _round_batch_size(self, batch_size: int) -> int:
+        """Round down to a valid multiple of micro_batch_split."""
+        micro_batch_split = max(1, int(self.config.get("micro_batch_split", 2)))
+        batch_size = max(micro_batch_split, int(batch_size))
+        return max(micro_batch_split, (batch_size // micro_batch_split) * micro_batch_split)
 
-        Probes at batch_size = S and 2S (where S = micro_batch_split) so that
-        both the rotation correlator (full-batch) and the shift matcher
-        (internally micro-batched at bs//2) scale between the two runs.
-        Fake zero inputs are used; a fake Fourier reference is injected directly
-        into ShiftMatcher so no template file is required.
+    def _is_cuda_oom(self, exc: Exception) -> bool:
+        """Return True for PyTorch and CUDA-driver OOM variants."""
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "cuda_error_out_of_memory" in msg
+            or "cudamemoryerror" in msg
+            or "cumemalloc" in msg
+        )
 
-            max_batch = (free_vram * safety - fixed) / per_sample
-
-        The safety margin is read from config key 'auto_batch_safety' (default 0.80).
-        """
-        from align_subtomograms import AlignmentRuntimeBuilder
-        from utils.io_utils import extract_subtomogram_patch_batch
-        from utils.volume_rotation import rotate_volumes
+    def _legacy_batch_size_hint(self) -> int:
+        """Keep the old linear estimator only as a starting hint for validation."""
+        from matcha.align_subtomograms import AlignmentRuntimeBuilder
+        from matcha.utils.io_utils import extract_subtomogram_patch_batch
+        from matcha.utils.volume_rotation import rotate_volumes
         import quaternionic
 
         probe_gpu_id = self.config.gpu_ids[0]
@@ -467,7 +683,6 @@ class AlignmentRunJob:
         torch.cuda.set_device(probe_device)
 
         micro_batch_split = int(self.config.get("micro_batch_split", 2))
-        # Probe at S and 2S so ShiftMatcher.micro_batch_size (= bs//2) also scales.
         probe_sizes = (micro_batch_split, 2 * micro_batch_split)
 
         mems = []
@@ -479,23 +694,17 @@ class AlignmentRunJob:
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(probe_device)
-            # Use mem_get_info so non-PyTorch CUDA allocations (NUFFT, cuFFT plans, etc.)
-            # are included in the measurement — max_memory_allocated misses these.
             free_base, _total = torch.cuda.mem_get_info(probe_device)
 
             runtime = fake_sub = fake_ctf = fake_shift = fake_rot = None
             try:
                 runtime = AlignmentRuntimeBuilder.prepare_config(probe_config)
                 N = int(runtime.N)
-                dtype_c = runtime.execution.dtype
                 dtype_r = runtime.execution.dtype_real
 
-                # Inject fake template state so both matchers can run without real files.
                 fake_template_np = np.zeros((N, N, N), dtype=np.float32)
                 runtime.execution.Correlator.set_template(fake_template_np)
-                runtime.execution.ShiftMatcher.reference_data_fourier = torch.zeros(
-                    1, N, N, N, device=probe_device, dtype=dtype_c
-                )
+                runtime.execution.ShiftMatcher.set_reference(fake_template_np)
 
                 fake_sub = torch.zeros(bs, N, N, N, device=probe_device, dtype=dtype_r)
                 fake_ctf = (
@@ -507,8 +716,6 @@ class AlignmentRunJob:
                 fake_rot = quaternionic.array(np.tile([[1.0, 0.0, 0.0, 0.0]], (bs, 1)))
 
                 with torch.no_grad():
-                    # Step 1: patch extraction + rotation (like _extract_rotated_batch)
-                    # normalize=False avoids div-by-zero on zero input
                     batched_data = extract_subtomogram_patch_batch(
                         volume=fake_sub,
                         shift=fake_shift,
@@ -522,14 +729,10 @@ class AlignmentRunJob:
                         microbatch_size=microbatch_size,
                         permute_before_sample=False,
                     )
-
-                    # Step 2: rotation search (full batch)
                     coeffs, bh_norms = runtime.execution.Correlator.get_sigma(batched_data)
                     del batched_data
                     runtime.execution.RotationMatcher.search_orientations(sigma=coeffs)
                     del coeffs, bh_norms
-
-                    # Step 3: shift search (internally micro-batched at bs//2)
                     runtime.execution.ShiftMatcher.search_shifts(
                         subtomos=fake_sub,
                         ctfs=fake_ctf,
@@ -539,46 +742,200 @@ class AlignmentRunJob:
 
                 torch.cuda.synchronize(probe_device)
                 free_after, _ = torch.cuda.mem_get_info(probe_device)
-                # Memory consumed by this probe = baseline free minus current free.
-                # This captures PyTorch tensors + NUFFT/cuFFT allocations uniformly.
                 mems.append(free_base - free_after)
 
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                print(
-                    f"[auto_batch] OOM during probe at batch_size={bs}; "
-                    f"falling back to batch_size={probe_sizes[0]}."
-                )
-                return probe_sizes[0]
+            except Exception as exc:
+                if self._is_cuda_oom(exc):
+                    torch.cuda.empty_cache()
+                    return probe_sizes[0]
+                raise
             finally:
                 del runtime, fake_sub, fake_ctf, fake_shift, fake_rot
+                gc.collect()
                 torch.cuda.empty_cache()
 
         mem_lo, mem_hi = mems
-        # Each probe step adds micro_batch_split particles, so per-sample cost is:
         per_sample = (mem_hi - mem_lo) / micro_batch_split
         fixed = mem_lo - micro_batch_split * per_sample
 
-        free, total = torch.cuda.mem_get_info(probe_device)
-
+        free, _total = torch.cuda.mem_get_info(probe_device)
         if per_sample <= 0:
-            print("[auto_batch] Per-sample memory estimate is non-positive; "
-                  f"using batch_size={probe_sizes[0]}.")
             return probe_sizes[0]
 
         safety = float(self.config.get("auto_batch_safety", 0.80))
-        max_batch = max(micro_batch_split, int((free * safety - max(0, fixed)) / per_sample))
-        # Round down to a multiple of micro_batch_split so all micro-batch
-        # chunks are equal size (avoids buffer mismatch in CrossCorrelationMatcher).
-        max_batch = max(micro_batch_split, (max_batch // micro_batch_split) * micro_batch_split)
+        max_batch = int((free * safety - max(0, fixed)) / per_sample)
+        return self._round_batch_size(max_batch)
 
+    def _pick_probe_particle_path(self) -> str | None:
+        """Choose one real particle path so probe metadata matches the run."""
+        if not self.run_data:
+            return None
+
+        for run_group in self.run_data:
+            if not isinstance(run_group, dict):
+                continue
+            for half_data in run_group.values():
+                if not isinstance(half_data, dict):
+                    continue
+                paths = list(half_data.get("subtomogram_paths", []) or [])
+                if paths:
+                    return paths[0]
+        return None
+
+    def _log_probe_result(self, result: dict) -> None:
+        """Print one concise line for a validated candidate batch size."""
         gib = 1 << 30
+        bs = result["batch_size"]
+        if result["safe"]:
+            print(
+                f"[auto_batch] probe batch_size={bs}: min_free {result['min_free']/gib:.1f} GiB "
+                f"(target {result['reserve_target']/gib:.1f} GiB, stage={result['stage']}) -> ok"
+            )
+            return
+
+        if result.get("probe_error", False):
+            detail = result.get("error", "probe failed")
+            print(
+                f"[auto_batch] probe batch_size={bs}: failure at {result['stage']} -> too large "
+                f"({detail})"
+            )
+            return
+
+        if result.get("oom", False):
+            detail = result.get("error", "CUDA OOM")
+            print(
+                f"[auto_batch] probe batch_size={bs}: OOM at {result['stage']} -> too large "
+                f"({detail})"
+            )
+            return
+
         print(
-            f"[auto_batch] GPU {probe_gpu_id}: {free/gib:.1f}/{total/gib:.1f} GiB free — "
-            f"fixed {fixed/gib:.2f} GiB, per-sample {per_sample/1e6:.1f} MB → "
-            f"batch_size = {max_batch}"
+            f"[auto_batch] probe batch_size={bs}: min_free {result['min_free']/gib:.1f} GiB "
+            f"below target {result['reserve_target']/gib:.1f} GiB (stage={result['stage']}) -> too large"
         )
-        return max_batch
+
+    def _probe_batch_size(self, batch_size: int, probe_path: str) -> dict:
+        """Run one candidate probe in an isolated subprocess."""
+        batch_size = self._round_batch_size(batch_size)
+        timeout_s = float(self.config.get("auto_batch_probe_timeout_s", 300.0))
+
+        recv_conn, send_conn = self.ctx.Pipe(duplex=False)
+        process = self.ctx.Process(
+            target=_probe_batch_size_worker,
+            args=(self.config.to_dict(), probe_path, batch_size, send_conn),
+        )
+        process.start()
+        send_conn.close()
+
+        result = None
+        timed_out = False
+        try:
+            if recv_conn.poll(timeout_s):
+                result = recv_conn.recv()
+            else:
+                timed_out = True
+        finally:
+            try:
+                recv_conn.close()
+            except Exception:
+                pass
+
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+
+        if result is not None:
+            return result
+
+        error = (
+            f"probe subprocess timed out after {timeout_s:.0f}s"
+            if timed_out
+            else f"probe subprocess exited with code {process.exitcode}"
+        )
+        return {
+            "batch_size": batch_size,
+            "safe": False,
+            "oom": False,
+            "probe_error": True,
+            "stage": "probe_process",
+            "min_free": 0.0,
+            "reserve_target": 0.0,
+            "free_start": 0.0,
+            "total": 0.0,
+            "error": error,
+        }
+
+    def _find_batch_size(self) -> int:
+        """Validate candidate batch sizes with an upward search from a small known-safe start."""
+        micro_batch_split = max(1, int(self.config.get("micro_batch_split", 2)))
+        probe_path = self._pick_probe_particle_path()
+        if probe_path is None:
+            fallback = self._legacy_batch_size_hint()
+            print(
+                "[auto_batch] Could not pick a representative particle path; "
+                f"falling back to heuristic batch_size={fallback}."
+            )
+            return fallback
+
+        default_start = max(4, micro_batch_split)
+        start_batch = self._round_batch_size(
+            int(self.config.get("auto_batch_probe_start", default_start))
+        )
+        start_batch = max(micro_batch_split, start_batch)
+        tested = {}
+
+        def _probe(bs: int) -> dict:
+            bs = self._round_batch_size(bs)
+            result = tested.get(bs)
+            if result is None:
+                result = self._probe_batch_size(bs, probe_path)
+                tested[bs] = result
+                self._log_probe_result(result)
+            return result
+
+        lower_ok = None
+        upper_bad = None
+
+        first = _probe(start_batch)
+        if first["safe"]:
+            lower_ok = first["batch_size"]
+        else:
+            if start_batch != micro_batch_split:
+                fallback = _probe(micro_batch_split)
+                if fallback["safe"]:
+                    lower_ok = fallback["batch_size"]
+                    upper_bad = start_batch
+            if lower_ok is None:
+                print(
+                    "[auto_batch] Even the smallest validated probe was tight or failed; "
+                    f"using batch_size={micro_batch_split}."
+                )
+                return micro_batch_split
+
+        if upper_bad is None:
+            candidate = max(lower_ok + micro_batch_split, lower_ok * 2)
+            while True:
+                result = _probe(candidate)
+                if result["safe"]:
+                    lower_ok = result["batch_size"]
+                    candidate = max(lower_ok + micro_batch_split, lower_ok * 2)
+                    continue
+                upper_bad = result["batch_size"]
+                break
+
+        while upper_bad - lower_ok > micro_batch_split:
+            mid = self._round_batch_size((lower_ok + upper_bad) // 2)
+            if mid <= lower_ok:
+                break
+            result = _probe(mid)
+            if result["safe"]:
+                lower_ok = result["batch_size"]
+            else:
+                upper_bad = result["batch_size"]
+
+        print(f"[auto_batch] Selected verified batch_size = {lower_ok}")
+        return lower_ok
 
     def _spawn_workers(self):
         """Start one alignment worker process per configured GPU."""

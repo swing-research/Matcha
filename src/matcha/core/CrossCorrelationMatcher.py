@@ -3,9 +3,9 @@ import spherical
 import torch
 import torch.nn.functional as F
 
-from utils.volume_ops import normalise
-from utils.setup_utils import compute_size
-from core.FLEBasis3D import FLEBasis3D
+from matcha.utils.volume_ops import normalise
+from matcha.utils.setup_utils import compute_size
+from matcha.core.FLEBasis3D import FLEBasis3D
 
 
 def _to_complex(dtype):

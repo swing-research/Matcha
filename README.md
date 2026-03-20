@@ -2,6 +2,9 @@
 
 > Official implementation of **"Fast Volume Alignment by Frequency-Marched Newton"**
 
+> Paper: [Fast Volume Alignment by Frequency-Marched Newton](https://arxiv.org/abs/2603.15285)
+> Authors: Fabian Kruse, Valentin Debarnot, Vinith Kishore, Ivan Dokmanić
+
 Matcha aligns volumes against a reference template via continuous SO(3) optimisation with frequency-marched Newton refinements. It can be integrated into subtomogram alignment for rapid Subtomogram Averaging (STA) in Cryo-ET and runs as a stand-alone CLI tool or directly as a **RELION External job**.
 
 
@@ -47,11 +50,19 @@ pip install "git+https://github.com/swing-research/Matcha.git"
 
 After installation, `matcha` and `matcha-example` are available on your `PATH`.
 
+In a source checkout, the top-level `configs/` and `data/` paths are convenience links to the canonical packaged resources under `src/matcha/`.
+
+The installed package bundles the default configs and lookup tables, so `matcha --config config.yaml --align` and `matcha-example --config config_example.yaml` work outside a source checkout.
+
+Inspect the CLI with `matcha --help` or `matcha-example --help`.
+
+For RELION `External` jobs, make sure RELION runs in the same Python environment, or that the queue submission environment activates it before launching Matcha.
+
 **Without installation** — use the bundled launchers, which set `PYTHONPATH` automatically:
 
 ```bash
-./bin/matcha         --config configs/config.yaml --align
-./bin/matcha-example --config configs/config_example.yaml
+./bin/matcha         --config config.yaml --align
+./bin/matcha-example --config config_example.yaml
 ```
 
 ---
@@ -75,19 +86,17 @@ The config already points to `data/run2_class001.mrc` — no further edits neede
 
 ```bash
 # without installation:
-./bin/matcha-example --config configs/config_example.yaml
+./bin/matcha-example --config config_example.yaml
 
 # installed CLI:
-matcha-example --config configs/config_example.yaml
+matcha-example --config config_example.yaml
 
-# directly:
-python src/run.py --example --config configs/config_example.yaml
 ```
 
 Optionally write metrics to JSON:
 
 ```bash
-./bin/matcha-example --config configs/config_example.yaml --metrics_out results.json
+./bin/matcha-example --config config_example.yaml --metrics_out results.json
 ```
 
 ### Expected output
@@ -104,7 +113,7 @@ search_orientations timing: mean=XX.XX ms, std=XX.XX ms, total=XX.XX s for 1000 
 
 ## Full alignment
 
-Edit `configs/config.yaml` to point to your data:
+Edit `configs/config.yaml` to point to your data. In a source checkout, `configs/` is a convenience link to the packaged defaults:
 
 | Field                 | Description                               |
 | --------------------- | ----------------------------------------- |
@@ -114,19 +123,23 @@ Edit `configs/config.yaml` to point to your data:
 | `gpu_ids`             | List of GPU indices to use                |
 | `box_size`            | Box size in pixels                        |
 
-`N` (volume size) and `voxel_size` are read automatically from the template MRC header.
+The volume- and voxel-size are read automatically from the template MRC header.
+
+Batching notes:
+
+- `num_subtomograms_per_batch: "auto"` starts from a small probe batch (default `4`), grows upward, and keeps the largest verified-safe batch size.
+- `auto_batch_safety` controls how much free VRAM to leave unused during auto mode; lower it if your GPU or scheduler limits are tight.
+- Set `num_subtomograms_per_batch` to an integer to bypass probing entirely, or set `auto_batch_probe_start` to change the initial auto-probe batch.
 
 Then run:
 
 ```bash
 # without installation:
-./bin/matcha --config configs/config.yaml --align
+./bin/matcha --config config.yaml --align
 
 # installed CLI:
-matcha --config configs/config.yaml --align
+matcha --config config.yaml --align
 
-# directly:
-python src/run.py --config configs/config.yaml --align
 ```
 
 ---
@@ -154,6 +167,35 @@ matcha --o External/jobXXX/       \
 | Output          | Particles STAR written to `<--o>/matcha_particles.star`; config copied to `<--o>/matcha_config.yaml`    |
 | Lifecycle files | `RELION_JOB_EXIT_SUCCESS` / `RELION_JOB_EXIT_FAILURE` and `RELION_OUTPUT_NODES.star` written to `<--o>` |
 
+### RELION GUI setup
+
+To run Matcha as a RELION `External` job from the GUI, create a new `External` job and fill the `Input` tab as follows:
+
+Before creating the `External` job, make sure the subtomogram extraction job was run with 3D output enabled: choose either `3D subtomos` or `3D pseudo-subtomos` during extraction.
+
+For queued RELION jobs, make sure the submission environment loads the Matcha Python environment before launching the `External` executable.
+
+- **External executable**: path to `matcha` or `bin/matcha`
+- **Input particles**: your subtomogram STAR file, for example `Extract/jobxxx/particles.star`
+- **Input 3D reference**: one half-map, for example `Reconstruct/jobxxx/half1.mrc`
+- **Input 3D mask**: optional mask, for example `MaskCreate/jobxxx/mask.mrc`
+
+If the reference path contains `half1` or `half2`, Matcha automatically resolves the matching counterpart in the same directory.
+
+<p align="center">
+  <img src="img/RELION_input.png" alt="RELION External job input tab">
+</p>
+
+In the `Params` tab, pass the Matcha config file and the RELION-specific overrides:
+
+- `config`: Matcha YAML file, for example `config.yaml` or `configs/config.yaml` in a source checkout
+- `mask_diameter`: mask diameter in Angstrom, matching the RELION GUI field
+- `offset_range`: shift search radius in pixels, matching the RELION GUI field
+
+<p align="center">
+  <img src="img/RELION_params.png" alt="RELION External job params tab">
+</p>
+
 ---
 
 ## Tips
@@ -177,18 +219,21 @@ export NUMBA_CACHE_DIR=/tmp/numba_cache
 
 ```
 matcha/
-├── bin/                       # Shell launchers (no installation needed)
+├── bin/                       # Shell launchers for source checkouts
 │   ├── matcha
 │   └── matcha-example
-├── configs/
-│   ├── config.yaml            # Config template for full alignment
-│   └── config_example.yaml   # Config for the benchmark example
-├── data/                      # Pre-computed FLE lookup tables
+├── configs -> src/matcha/configs   # Convenience link to the canonical config files
+├── data -> src/matcha/data         # Convenience link to the canonical lookup tables
 ├── src/
-│   ├── run.py                 # Unified CLI entry point
-│   ├── example.py             # Benchmark example
-│   ├── align_subtomograms.py
-│   ├── core/                  # Matcha, SOFFT, CrossCorrelationMatcher
-│   └── utils/                 # I/O, rotation ops, volume ops
-└── pyproject.toml
+│   └── matcha/
+│       ├── run.py             # Main CLI entry point
+│       ├── example.py         # Benchmark CLI
+│       ├── align_subtomograms.py
+│       ├── configs/           # Canonical packaged default configs
+│       ├── data/              # Canonical packaged lookup tables
+│       ├── core/              # Alignment, SO(3), and correlation kernels
+│       └── utils/             # I/O, setup, batching, and rotation helpers
+├── tests/                     # Lightweight package/install smoke tests
+├── pyproject.toml
+└── LICENSE
 ```

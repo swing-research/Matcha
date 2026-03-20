@@ -1,8 +1,8 @@
 import torch
 from torch.nn import functional as F
-from core.SOFFT import SOFFT
-from core.WignerDMatrices import WignerDMatrices
-from core.WignerDGradients import WignerDGradients
+from matcha.core.SOFFT import SOFFT
+from matcha.core.WignerDMatrices import WignerDMatrices
+from matcha.core.WignerDGradients import WignerDGradients
 
 from ml_collections import ConfigDict
 from typing import Tuple    

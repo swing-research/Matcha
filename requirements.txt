@@ -119,8 +119,6 @@ pandas==3.0.0
     # via starfile
 pillow==12.1.0
     # via torchvision
-pyaml==25.7.0
-    # via -r requirements.in
 pyarrow==23.0.0
     # via starfile
 python-dateutil==2.9.0.post0
@@ -128,7 +126,6 @@ python-dateutil==2.9.0.post0
 pyyaml==6.0.3
     # via
     #   ml-collections
-    #   pyaml
 quaternionic==1.0.17
     # via
     #   -r requirements.in

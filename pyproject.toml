@@ -1,9 +1,25 @@
 [project]
 name = "matcha"
 version = "0.1.0"
-description = "An efficient tool for subtomogram averaging using continuous optimization."
+description = "Fast volume alignment by frequency-marched Newton for subtomogram averaging workflows."
 readme = "README.md"
 requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Fabian Kruse" },
+  { name = "Valentin Debarnot" },
+  { name = "Vinith Kishore" },
+  { name = "Ivan Dokmanić" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
 dependencies = [
   "torch",
   "torchvision",
@@ -27,16 +43,24 @@ dependencies = [
 dev = ["pip-tools"]
 
 [project.scripts]
-matcha = "run:cli"
-matcha-example = "example:cli"
+matcha = "matcha.run:cli"
+matcha-example = "matcha.example:cli"
+
+[project.urls]
+Homepage = "https://github.com/swing-research/Matcha"
+Repository = "https://github.com/swing-research/Matcha"
+Documentation = "https://arxiv.org/abs/2603.15285"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["run", "example", "align_subtomograms"]
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["matcha", "core", "utils"]
+include = ["matcha*"]
+
+[tool.setuptools.package-data]
+matcha = ["configs/*.yaml", "data/*.mat"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

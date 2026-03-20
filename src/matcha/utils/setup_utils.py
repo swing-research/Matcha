@@ -23,7 +23,7 @@ import torch
 from ml_collections import ConfigDict
 from torch.nn import functional as F
 
-from utils.volume_ops import get_spherical_mask
+from matcha.utils.volume_ops import get_spherical_mask
 
 
 def set_random_seed(seed: int) -> None:

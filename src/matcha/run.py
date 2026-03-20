@@ -1,6 +1,5 @@
-"""
-File to run the accelerated alignment algorithm.
-"""
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -8,23 +7,42 @@ import re
 import shutil
 from pathlib import Path
 
-import mrcfile
-import ml_collections
-import pandas as pd
-import starfile
-import yaml
-import torch
-import torch.multiprocessing as mp
+from matcha import __version__
+from matcha.resources import get_packaged_path
 
 
 def _resolve_config_path(config_arg: str) -> str:
-    if os.path.isfile(config_arg):
-        return config_arg
-    candidate = os.path.join("configs", config_arg)
-    if os.path.isfile(candidate):
-        return candidate
+    raw = Path(config_arg).expanduser()
+    candidates = [raw]
+    if not raw.parts or raw.parts[0] != "configs":
+        candidates.append(Path("configs") / raw)
+
+    tried: list[str] = []
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str not in tried:
+            tried.append(candidate_str)
+        if candidate.is_file():
+            return str(candidate.resolve())
+
+    normalized = raw.as_posix().lstrip("./")
+    package_candidates = []
+    if normalized.startswith("configs/"):
+        package_candidates.append(normalized)
+    else:
+        package_candidates.append(f"configs/{normalized}")
+    if raw.name and f"configs/{raw.name}" not in package_candidates:
+        package_candidates.append(f"configs/{raw.name}")
+
+    for rel in package_candidates:
+        packaged = get_packaged_path(rel)
+        if packaged is not None:
+            return str(packaged.resolve())
+        if rel not in tried:
+            tried.append(rel)
+
     raise FileNotFoundError(
-        f"Config not found: '{config_arg}'. Tried '{config_arg}' and '{candidate}'."
+        f"Config not found: '{config_arg}'. Tried {', '.join(repr(item) for item in tried)}."
     )
 
 
@@ -34,7 +52,7 @@ def _resolve_resource_path(raw_path: str, config_path: str) -> str:
         return str(path)
 
     config_dir = Path(config_path).resolve().parent
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     candidates = [
         Path.cwd() / path,
         config_dir / path,
@@ -43,6 +61,10 @@ def _resolve_resource_path(raw_path: str, config_path: str) -> str:
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate.resolve())
+
+    packaged = get_packaged_path(path.as_posix())
+    if packaged is not None:
+        return str(packaged.resolve())
     return str(raw_path)
 
 
@@ -54,7 +76,11 @@ def _resolve_lookup_table_paths(config, config_path: str) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the accelerated alignment algorithm.")
+    parser = argparse.ArgumentParser(
+        description="Run Matcha volume alignment workflows.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to the configuration file.")
     parser.add_argument("--align", action="store_true", help="Run the alignment workflow.")
     parser.add_argument("--example", action="store_true", help="Run the orientation search benchmark example.")
@@ -64,7 +90,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional path to write benchmark metrics as JSON (only for --example).",
     )
-    # RELION External job contract
     parser.add_argument("--o", type=str, default="", help="RELION output directory.")
     parser.add_argument("--in_parts", type=str, default="", help="RELION input particles STAR.")
     parser.add_argument("--in_3dref", type=str, default="", help="RELION input 3D reference map.")
@@ -91,8 +116,10 @@ def _resolve_example_default_config(config_arg: str) -> str:
     if config_arg != "config.yaml":
         return config_arg
     for candidate in ("config_example.yaml", os.path.join("configs", "config_example.yaml")):
-        if os.path.isfile(candidate):
-            return candidate
+        try:
+            return _resolve_config_path(candidate)
+        except FileNotFoundError:
+            continue
     return config_arg
 
 
@@ -196,7 +223,6 @@ def _resolve_relion_templates(path_3dref: str):
             )
         return [half1, half2]
 
-    # Single map mode: use same map for both halves
     return [path_str, path_str]
 
 
@@ -239,30 +265,20 @@ def _resolve_gpu_ids(args, extras, config):
 
 
 def _write_relion_output_nodes(output_dir: Path, output_particle_star: str):
-    # RELION 5 pipeline node types (src/pipeline_jobs.h):
-    #   0  = undefined
-    #   1  = movies
-    #   2  = micrographs
-    #   3  = particles (SPA)
-    #   4  = 2D class averages
-    #   5  = 3D class averages
-    #   6  = 3D reference map
-    #   7  = mask
-    #   9  = postprocess
-    #   13 = tomo tomograms STAR
-    #   15 = tomo particles STAR  <-- correct for subtomogram averaging
-    _TOMO_PARTS_NODE_TYPE = 15
+    import pandas as pd
+    import starfile
 
+    tomo_parts_node_type = 15
     output_nodes_path = output_dir / "RELION_OUTPUT_NODES.star"
     df_nodes = pd.DataFrame(
         {
             "rlnPipeLineNodeName": [output_particle_star],
-            "rlnPipeLineNodeType": [_TOMO_PARTS_NODE_TYPE],
+            "rlnPipeLineNodeType": [tomo_parts_node_type],
         }
     )
     starfile.write({"output_nodes": df_nodes}, output_nodes_path, overwrite=True)
     print(f"[RELION] Output nodes: {output_nodes_path}")
-    print(f"[RELION]   {output_particle_star}  (type={_TOMO_PARTS_NODE_TYPE})")
+    print(f"[RELION]   {output_particle_star}  (type={tomo_parts_node_type})")
 
 
 def _clear_relion_exit_markers(output_dir: Path):
@@ -277,14 +293,13 @@ def _touch_marker(output_dir: Path, marker_name: str):
 
 
 def _read_template_meta(path: str):
-    """Return (N, voxel_size_angstrom) from an MRC file header."""
+    import mrcfile
+
     with mrcfile.open(path, mode="r", permissive=True) as mrc:
         shape = mrc.data.shape
         voxel_size = float(mrc.voxel_size.x)
     if len(shape) != 3 or shape[0] != shape[1] or shape[0] != shape[2]:
-        raise ValueError(
-            f"Template MRC is not a cube: shape={shape}. N cannot be inferred."
-        )
+        raise ValueError(f"Template MRC is not a cube: shape={shape}. N cannot be inferred.")
     return shape[0], voxel_size
 
 
@@ -309,8 +324,8 @@ def _run_relion_mode(args, unknown_args, config, config_path: Path):
         return
 
     try:
-        from utils.setup_utils import assert_inputs
-        from utils.run_utils import run_align
+        from matcha.utils.setup_utils import assert_inputs
+        from matcha.utils.run_utils import run_align
 
         config.relion_external_mode = True
         config.random_half_split = True
@@ -320,12 +335,11 @@ def _run_relion_mode(args, unknown_args, config, config_path: Path):
         config.path_templates = _resolve_relion_templates(args.in_3dref)
         config.subset_IDs = [1, 2] if bool(config.get("do_random_half", True)) else [1]
 
-        # Auto-read N and voxel_size from the template MRC (CLI flags take priority below)
-        template_N, template_voxel_size = _read_template_meta(config.path_templates[0])
-        config.N = template_N
+        template_n, template_voxel_size = _read_template_meta(config.path_templates[0])
+        config.N = template_n
         config.voxel_size = template_voxel_size
-        config.radius = template_N // 2
-        print(f"[INFO] Template shape: N={template_N}, voxel_size={template_voxel_size:.4f} Å")
+        config.radius = template_n // 2
+        print(f"[INFO] Template shape: N={template_n}, voxel_size={template_voxel_size:.4f} A")
 
         if args.in_mask:
             config.path_template_mask = args.in_mask
@@ -346,7 +360,7 @@ def _run_relion_mode(args, unknown_args, config, config_path: Path):
             config.box_size = round(args.mask_diameter / config.voxel_size)
             config.radius = round(args.mask_diameter / (2.0 * config.voxel_size))
             print(
-                f"[INFO] --mask_diameter={args.mask_diameter} Å → "
+                f"[INFO] --mask_diameter={args.mask_diameter} A -> "
                 f"box_size={config.box_size}, radius={config.radius}"
             )
 
@@ -399,70 +413,73 @@ def _run_relion_mode(args, unknown_args, config, config_path: Path):
 
 
 def main(argv=None):
-    # We don't use autodiff in this project
-    with torch.no_grad():
-        parser = _build_parser()
-        args, unknown_args = parser.parse_known_args(argv)
+    parser = _build_parser()
+    args, unknown_args = parser.parse_known_args(argv)
 
-        if args.metrics_out and not args.example:
-            parser.error("--metrics_out is only valid with --example")
+    if args.metrics_out and not args.example:
+        parser.error("--metrics_out is only valid with --example")
 
-        relion_mode = bool(args.o or args.in_parts or args.in_3dref or args.in_mask)
-        if not relion_mode and not args.align and not args.example:
-            parser.error("Specify one mode: --align, --example, or RELION flags (--o/--in_parts/--in_3dref).")
-        if relion_mode and args.example:
-            parser.error("--example cannot be combined with RELION flags.")
+    relion_mode = bool(args.o or args.in_parts or args.in_3dref or args.in_mask)
+    if not relion_mode and not args.align and not args.example:
+        parser.error("Specify one mode: --align, --example, or RELION flags (--o/--in_parts/--in_3dref).")
+    if relion_mode and args.example:
+        parser.error("--example cannot be combined with RELION flags.")
 
-        # Get config file
-        config_arg = _resolve_example_default_config(args.config) if args.example else args.config
-        config_path = _resolve_config_path(config_arg)
-        with open(config_path) as cf_file:
-            config_yaml = yaml.safe_load(cf_file.read())
-        config = ml_collections.ConfigDict(config_yaml, type_safe=True)
-        _resolve_lookup_table_paths(config=config, config_path=config_path)
+    import ml_collections
+    import torch
+    import torch.multiprocessing as mp
+    import yaml
 
-        if relion_mode:
-            _run_relion_mode(args=args, unknown_args=unknown_args, config=config, config_path=config_path)
-            return
-
-        if args.example:
-            from example import main as run_example
-
-            metrics = run_example(config)
-            if args.metrics_out:
-                with open(args.metrics_out, "w", encoding="utf-8") as mf:
-                    json.dump(metrics or {}, mf, indent=2)
-            return
-
-        if args.align:
-            from utils.setup_utils import assert_inputs
-            from utils.run_utils import run_align
-
-            template_N, template_voxel_size = _read_template_meta(config.path_templates[0])
-            config.N = template_N
-            config.voxel_size = template_voxel_size
-            config.radius = template_N // 2
-            config.subset_IDs = [1, 2] if bool(config.get("do_random_half", True)) else [1]
-
-            if args.offset_range > 0:
-                config.shift_search_radius = args.offset_range
-
-            assert_inputs(config)
-
-            out_dir = Path(config.path_output).parent
-            out_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(config_path, out_dir / "matcha_config.yaml")
-
-            # Run alignment
-            run_align(config=config)
-            return
-
-
-def cli() -> None:
     mp.set_start_method("spawn", force=True)
     torch.multiprocessing.set_sharing_strategy("file_system")
+
     with torch.inference_mode():
-        main()
+        with torch.no_grad():
+            config_arg = _resolve_example_default_config(args.config) if args.example else args.config
+            config_path = _resolve_config_path(config_arg)
+            with open(config_path, encoding="utf-8") as cf_file:
+                config_yaml = yaml.safe_load(cf_file.read())
+            config = ml_collections.ConfigDict(config_yaml, type_safe=True)
+            _resolve_lookup_table_paths(config=config, config_path=config_path)
+
+            if relion_mode:
+                _run_relion_mode(args=args, unknown_args=unknown_args, config=config, config_path=Path(config_path))
+                return
+
+            if args.example:
+                from matcha.example import main as run_example
+
+                metrics = run_example(config)
+                if args.metrics_out:
+                    with open(args.metrics_out, "w", encoding="utf-8") as mf:
+                        json.dump(metrics or {}, mf, indent=2)
+                return
+
+            if args.align:
+                from matcha.utils.setup_utils import assert_inputs
+                from matcha.utils.run_utils import run_align
+
+                template_n, template_voxel_size = _read_template_meta(config.path_templates[0])
+                config.N = template_n
+                config.voxel_size = template_voxel_size
+                config.radius = template_n // 2
+                config.subset_IDs = [1, 2] if bool(config.get("do_random_half", True)) else [1]
+
+                if args.offset_range > 0:
+                    config.shift_search_radius = args.offset_range
+
+                assert_inputs(config)
+
+                out_dir = Path(config.path_output).parent
+                out_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(config_path, out_dir / "matcha_config.yaml")
+
+                run_align(config=config)
+                return
+
+
+def cli(argv=None) -> None:
+    main(argv)
 
 
 if __name__ == "__main__":

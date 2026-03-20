@@ -1,4 +1,4 @@
-# Config for `python src/run.py --align configs/config.yaml`
+# Config template for `matcha --config config.yaml --align` or `./bin/matcha --config config.yaml --align`
 #
 # When run as a RELION External job, most Required fields are set automatically
 # from the GUI - no need to edit them here:
@@ -22,7 +22,7 @@ particles_starfile: "/path/to/particles.star"
 path_output: "matcha_output"
 
 gpu_ids: [0]                      # prefer --gpu on the CLI
-box_size: 570                     # voxels; prefer --mask_diameter on the CLI
+box_size: 500                     # voxels; prefer --mask_diameter on the CLI
 
 # -- Algorithm -----------------------------------------------------------------
 # Li defines the progressive refinement schedule; max(Li) = correlator bandlimit
@@ -38,8 +38,9 @@ use_prior_rotation: false
 precision_mode: "fast"            # "fast" (1e-4) or "accurate" (formula-derived)
 
 # -- Performance ---------------------------------------------------------------
-num_subtomograms_per_batch: "auto"  # or an integer; "auto" probes GPU memory
-auto_batch_safety: 0.9             # fraction of free VRAM to target
+num_subtomograms_per_batch: "auto"  # or an integer; "auto" validates small upward GPU probes
+auto_batch_safety: 0.8             # fraction of free VRAM allowed during auto-batch probing
+auto_batch_probe_start: 4          # optional: initial batch size used by auto mode
 reduce_memory: true
 micro_batch_split: 2
 
@@ -49,8 +50,8 @@ shift_search_radius: 2            # prefer --offset_range on the CLI
 shift_upsample_factor: 8          # sub-pixel precision: 1/factor voxels
 
 # -- Lookup tables -------------------------------------------------------------
-cs_path: "data/cs_l=3000_k=2500.mat"
-jl_zeros_path: "data/jl_zeros_l=3000_k=2500.mat"
+cs_path: "../data/cs_l=3000_k=2500.mat"
+jl_zeros_path: "../data/jl_zeros_l=3000_k=2500.mat"
 
 # -- Other ---------------------------------------------------------------------
 do_random_half: true              # true = align each rlnRandomSubset half against its own template

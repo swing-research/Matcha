@@ -1,4 +1,4 @@
-# Config for `python src/example.py --config configs/config_example.yaml`
+# Config template for `matcha-example --config config_example.yaml` or `./bin/matcha-example --config config_example.yaml`
 
 # -- Required ------------------------------------------------------------------
 path_template: "data/run2_class001.mrc"
@@ -12,11 +12,12 @@ matcha_config:
   oversampling_factor_K: 2
 
 # -- Defaults (rarely need changing) ------------------------------------------
+random_seed: 0                    # reproducible benchmark seed
 precision_mode: "fast"            # "fast" (1e-4) or "accurate" (formula-derived)
 
 # -- Lookup tables -------------------------------------------------------------
-cs_path: "data/cs_l=3000_k=2500.mat"
-jl_zeros_path: "data/jl_zeros_l=3000_k=2500.mat"
+cs_path: "../data/cs_l=3000_k=2500.mat"
+jl_zeros_path: "../data/jl_zeros_l=3000_k=2500.mat"
 
 # -- Example benchmark settings -----------------------------------------------
 example_config:
