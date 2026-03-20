@@ -3,6 +3,18 @@ import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+def resolve_precision_mode(config) -> str:
+    """Validate and return precision_mode from config.
+
+    Returns 'fast' or 'accurate'. Defaults to 'accurate'.
+    """
+    mode = str(config.get("precision_mode", "accurate")).strip().lower()
+    if mode not in ("fast", "accurate"):
+        raise ValueError(
+            f"Unknown precision_mode '{mode}'. Choose 'fast' or 'accurate'."
+        )
+    return mode
+
 import numpy as np
 import pandas as pd
 import quaternionic
@@ -44,16 +56,43 @@ def transform_filename(filename: str) -> str:
     return f"{prefix}_{subtomo_prefix}_subtomo{subtomo_number}.mrc"
 
 
+def _read_star_raw(star_path: str) -> dict:
+    """Read a RELION STAR file and return a dict with all named blocks."""
+    raw = starfile.read(star_path)
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        # Older starfile versions may return a list; build a best-guess dict.
+        keys = ["general", "optics", "particles"]
+        return {keys[i]: raw[i] for i in range(min(len(keys), len(raw)))}
+    return {"particles": raw}
+
+
 def _read_particles_table(star_path: str):
-    table = starfile.read(star_path)
-    if isinstance(table, dict):
-        if "particles" in table:
-            table = table["particles"]
-        else:
-            table = next(iter(table.values()))
-    if isinstance(table, list):
-        table = table[2] if len(table) > 2 else table[0]
-    return table
+    raw = _read_star_raw(star_path)
+    if "particles" in raw:
+        return raw["particles"]
+    # Fall back to last block if 'particles' key not present
+    return list(raw.values())[-1]
+
+
+def _validate_subtomograms_3d(star_path: str) -> None:
+    """Raise if _rlnTomoSubTomosAre2DStacks != 0 (2D stacks not supported)."""
+    raw = _read_star_raw(star_path)
+    general = raw.get("general")
+    if general is None:
+        return
+    col = "rlnTomoSubTomosAre2DStacks"
+    val = None
+    if isinstance(general, pd.DataFrame) and col in general.columns:
+        val = int(general[col].iloc[0])
+    elif isinstance(general, dict) and col in general:
+        val = int(general[col])
+    if val is not None and val != 0:
+        raise ValueError(
+            f"_rlnTomoSubTomosAre2DStacks = {val}. "
+            "matcha requires 3D subtomograms (_rlnTomoSubTomosAre2DStacks = 0)."
+        )
 
 
 def _particle_token(path_like: str) -> str:
@@ -167,6 +206,7 @@ def _resolve_particles_image_path(raw: str, star_parent: Path) -> Path:
 
 
 def get_subtomogram_paths_from_particles(star_path: str) -> List[str]:
+    _validate_subtomograms_3d(star_path)
     df = _read_particles_table(star_path)
     if "rlnImageName" not in df.columns:
         raise ValueError("Input particles STAR is missing required column 'rlnImageName'.")
@@ -232,7 +272,7 @@ def _compute_masks(shape: Tuple[int, int, int], radius: float, cosine_width: flo
 
 def setup_mask(config: ConfigDict, rotation_only: bool = False) -> ConfigDict:
     n = int(config["N"])
-    radius = float(config["radius"])
+    radius = float(config.get("radius", n // 2))
 
     config.execution["spherical_mask"] = get_spherical_mask((n, n, n), radius)
     config.execution["spherical_mask_torch"] = torch.tensor(
@@ -268,9 +308,6 @@ def get_prior_shifts(
     config: ConfigDict,
 ) -> torch.Tensor:
     _ = subtomograms
-    if bool(config.get("use_precenter", False)):
-        raise NotImplementedError("Minimal copy does not include precenter-based shift estimation.")
-
     subset = _lookup_particles(df, tomogram_file_names)
 
     if all(c in subset.columns for c in ["rlnOriginXAngst", "rlnOriginYAngst", "rlnOriginZAngst"]):
@@ -282,7 +319,7 @@ def get_prior_shifts(
         shifts = np.zeros((len(tomogram_file_names), 3), dtype=np.float32)
 
     prior_shifts = torch.from_numpy(shifts).to(device=config["device"], dtype=config.execution["dtype_real"])
-    prior_shifts = prior_shifts.unsqueeze(1).expand(-1, int(config["num_base_shifts"]), -1)
+    prior_shifts = prior_shifts.unsqueeze(1).expand(-1, 1, -1)
 
     pad_count = int(config["num_subtomograms_per_batch"]) - prior_shifts.shape[0]
     if pad_count > 0:
@@ -292,11 +329,10 @@ def get_prior_shifts(
 
 def get_rotation_tracker(tomogram_file_names: List[str], df: pd.DataFrame, config: ConfigDict):
     batch_size = int(config.num_subtomograms_per_batch)
-    num_base_shifts = int(config.num_base_shifts)
 
     if not bool(config.get("use_prior_rotation", False)):
         base = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float64)
-        tiled = np.tile(base, (batch_size * num_base_shifts, 1))
+        tiled = np.tile(base, (batch_size, 1))
         return quaternionic.array(tiled)
 
     subset = _lookup_particles(df, tomogram_file_names)
@@ -304,11 +340,7 @@ def get_rotation_tracker(tomogram_file_names: List[str], df: pd.DataFrame, confi
         raise ValueError("Missing Euler angle columns in particles table for prior rotation.")
 
     eulers_deg = subset[["rlnAngleRot", "rlnAngleTilt", "rlnAnglePsi"]].to_numpy(dtype=np.float64)
-    q = quaternionic.array.from_euler_angles(np.deg2rad(eulers_deg)).conj()
-
-    if num_base_shifts > 1:
-        q = quaternionic.array(np.repeat(q.ndarray, num_base_shifts, axis=0))
-    return q
+    return quaternionic.array.from_euler_angles(np.deg2rad(eulers_deg)).conj()
 
 
 def pad_data(padding_size: int, subtomograms, ctfs, subtomos, rotation_tracker):
@@ -338,12 +370,8 @@ def assert_inputs(config: ConfigDict) -> None:
     missing_templates = [p for p in config.path_templates if not Path(p).is_file()]
     assert not missing_templates, f"Missing template files: {missing_templates}"
 
-    if not Path(config.run_data_path).is_file():
-        raise AssertionError(f"run_data_path does not exist: {config.run_data_path}")
-
-    if not bool(config.get("particle_paths_from_star", False)):
-        if not Path(config.path_subtomograms).is_dir():
-            raise AssertionError(f"path_subtomograms does not exist: {config.path_subtomograms}")
+    if not Path(config.particles_starfile).is_file():
+        raise AssertionError(f"particles_starfile does not exist: {config.particles_starfile}")
 
 
 def _random_subset_lookup(star_path: str, seed: int) -> Dict[str, int]:
@@ -369,17 +397,17 @@ def _random_subset_lookup(star_path: str, seed: int) -> Dict[str, int]:
 
 def setup_data_splits(config: ConfigDict, subtomograms: List[str]):
     if bool(config.get("random_half_split", False)):
-        particles_df = _read_particles_table(config.run_data_path)
+        particles_df = _read_particles_table(config.particles_starfile)
         if "rlnRandomSubset" in particles_df.columns:
-            subset_1 = filter_by_subset(config.run_data_path, 1, subtomograms)
-            subset_2 = filter_by_subset(config.run_data_path, 2, subtomograms)
+            subset_1 = filter_by_subset(config.particles_starfile, 1, subtomograms)
+            subset_2 = filter_by_subset(config.particles_starfile, 2, subtomograms)
             print(
                 "Using existing rlnRandomSubset from input particles STAR: "
                 f"half1={len(subset_1)}, half2={len(subset_2)}."
             )
         else:
             subset_lookup = _random_subset_lookup(
-                star_path=config.run_data_path,
+                star_path=config.particles_starfile,
                 seed=int(config.get("random_seed", 0)),
             )
             subset_1 = [p for p in subtomograms if subset_lookup.get(_particle_token(p)) == 1]
@@ -405,7 +433,7 @@ def setup_data_splits(config: ConfigDict, subtomograms: List[str]):
 
     num_halves = len(config.path_templates)
 
-    subset_1 = filter_by_subset(config.run_data_path, config.subset_IDs[0], subtomograms)
+    subset_1 = filter_by_subset(config.particles_starfile, config.subset_IDs[0], subtomograms)
 
     run_data = {
         "half1": {
@@ -416,7 +444,7 @@ def setup_data_splits(config: ConfigDict, subtomograms: List[str]):
     }
 
     if num_halves == 2:
-        subset_2 = filter_by_subset(config.run_data_path, config.subset_IDs[1], subtomograms)
+        subset_2 = filter_by_subset(config.particles_starfile, config.subset_IDs[1], subtomograms)
         run_data["half2"] = {
             "ref": config.path_templates[1],
             "subset_ID": config.subset_IDs[1],

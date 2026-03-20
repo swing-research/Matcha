@@ -1,73 +1,65 @@
-# Minimal config for `python src/run.py --align`
+# Config for `python src/run.py --align configs/config.yaml`
+#
+# When run as a RELION External job, most Required fields are set automatically
+# from the GUI - no need to edit them here:
+#
+#   RELION GUI field          -> config / CLI flag
+#   -------------------------------------------------
+#   "Input 3D reference"      -> path_templates
+#   "Input 3D mask"           -> path_template_mask
+#   "Input particles"         -> particles_starfile
+#   "Mask diameter (A)"       -> --mask_diameter  (sets box_size)
+#   "Offset range (pix.)"     -> --offset_range   (sets shift_search_radius)
+#   "Number of GPUs"          -> --gpu            (sets gpu_ids)
 
-random_seed: 42
-
-# Input data
-# path_templates:
-#   - "/path/to/half1_template.mrc"
-#   - "/path/to/half2_template.mrc"
-# path_template_mask: ""
-
+# -- Required ------------------------------------------------------------------
 path_templates:
   - "/path/to/half1_template.mrc"
   - "/path/to/half2_template.mrc"
-path_template_mask: "" # optional, leave empty to skip
+path_template_mask: ""            # optional; leave empty to skip masking
 
-path_subtomograms: "/path/to/Subtomograms"
-subdirs_subtomograms: [] # e.g. ["tomo001", "tomo002"]
-subtomograms_file: ""
-run_data_path: "/path/to/run_it000_data.star"
+particles_starfile: "/path/to/particles.star"
+path_output: "matcha_output"
 
-# Output
-path_output: "debugging"
-tmp_dir: "tmp"
-outputs_dir: "outputs"
-bin_factor: 2
+gpu_ids: [0]                      # prefer --gpu on the CLI
+box_size: 570                     # voxels; prefer --mask_diameter on the CLI
 
-# FLE basis lookup tables
-cs_path: "data/cs_l=3000_k=2500.mat"
-jl_zeros_path: "data/jl_zeros_l=3000_k=2500.mat"
+# -- Algorithm -----------------------------------------------------------------
+# Li defines the progressive refinement schedule; max(Li) = correlator bandlimit
+matcha_config:
+  Li: [30, 40, 65]    # In paper: bin1: [30, 40, 65], bin2: [30,40]
+  candidates: 10      # candidate rotations to refine per Newton round
+  num_steps: 5        # Newton steps per candidate
+  oversampling_factor_K: 2
 
-# Dataset meta
-relion_version: "relion5" # "relion5" or "relion_old"
-subset_IDs: [1, 2]
-voxel_size: 3.82 #*1.91
-box_size: 570
-
-# Compute
-gpu_ids: [2]
-precision: "float32" # "float32" or "float64"
-
-# Batch/search settings
-num_subtomograms_per_batch: 80
-num_base_shifts: 1
-num_alternations: 3 #from command line
-upsample_factors: [1, 10, 100]
-
-# Rotation initialization
+# -- Defaults (rarely need changing) ------------------------------------------
+num_alternations: 3
 use_prior_rotation: false
-use_precenter: false
+precision_mode: "fast"            # "fast" (1e-4) or "accurate" (formula-derived)
 
-# Correlator settings
-N: 100 # read this from file
-bandlimit: 40
-expansion_epsilon: 0.0001
-radius: 50
+# -- Performance ---------------------------------------------------------------
+num_subtomograms_per_batch: "auto"  # or an integer; "auto" probes GPU memory
+auto_batch_safety: 0.9             # fraction of free VRAM to target
 reduce_memory: true
 micro_batch_split: 2
 
-# Keep search band consistent with the original full config
-newton_ls: [40]
-so3fft_oversampling_factor: 2
+# -- Shift refinement ----------------------------------------------------------
+do_ctf_correction: false
+shift_search_radius: 2            # prefer --offset_range on the CLI
+shift_upsample_factor: 8          # sub-pixel precision: 1/factor voxels
 
-# Optional Matcha config (recommended for explicit control)
-matcha_config:
-  Li: [30, 40]
-  candidates: 10
+# -- Lookup tables -------------------------------------------------------------
+cs_path: "data/cs_l=3000_k=2500.mat"
+jl_zeros_path: "data/jl_zeros_l=3000_k=2500.mat"
+
+# -- Other ---------------------------------------------------------------------
+do_random_half: true              # true = align each rlnRandomSubset half against its own template
+random_seed: 42
+
+# -- Expert --------------------------------------------------------------------
+matcha_config_expert:
   reinits: 1
-  num_steps: 5
   step_type: "newton"
   stop_early: false
   do_random_sampling: false
   reinits_iterations: 0
-  oversampling_factor_K: 2

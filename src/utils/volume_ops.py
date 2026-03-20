@@ -14,22 +14,22 @@ def get_spherical_mask(size: tuple, radius: float, sigma: float = 0):
     return soft_mask
 
 
-def mean_torch(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def mean(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Calculate the mean of a volume using a mask."""
     if mask.sum() == 0:
         return torch.tensor(0.0, device=vol.device, dtype=vol.dtype)
     return (vol * mask).sum() / mask.sum()
 
 
-def std_torch(vol: torch.Tensor, mask: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+def std(vol: torch.Tensor, mask: torch.Tensor, mean_val: torch.Tensor) -> torch.Tensor:
     """Calculate the standard deviation of a volume using a mask and a precomputed mean."""
-    return torch.sqrt(mean_torch(vol**2, mask) - mean**2)
+    return torch.sqrt(mean(vol**2, mask) - mean_val**2)
 
 
-def normalise_torch(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def normalise(vol: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Normalize a volume using a mask."""
     if mask.sum() == 0:
         return vol
-    mean = mean_torch(vol, mask)
-    std = std_torch(vol, mask, mean)
-    return (vol - mean) / std
+    mean_val = mean(vol, mask)
+    std_val = std(vol, mask, mean_val)
+    return (vol - mean_val) / std_val

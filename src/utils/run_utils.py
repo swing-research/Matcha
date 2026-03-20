@@ -17,8 +17,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 from utils.setup_utils import get_subtomogram_paths_from_particles, setup_data_splits
-from utils.io_utils import load_subtomogram_cpu, load_ctf_cpu, load_ctf_relion5_cpu, join_data, join_data_relion_old
-from utils.setup_utils import find_mrc_in_selected_subdirs
+from utils.io_utils import load_subtomogram_cpu, load_ctf_relion5_cpu, join_data
 
 def _read_worker(p:str, ctf_loader, base_str:str, replace_str:str):
     """Thread worker: load one subtomogram + its CTF with error capture.
@@ -31,9 +30,8 @@ def _read_worker(p:str, ctf_loader, base_str:str, replace_str:str):
     - tuple (p, st_cpu, ctf_cpu, error)
     """
     try:
-        st_cpu = load_subtomogram_cpu(p, dtype=np.float32)   # np or torch
-        ctf_cpu = ctf_loader(p.replace(base_str, replace_str), transpose=False)  # np
-        #st_cpu = np.roll(np.fft.irfftn(np.fft.rfftn(np.roll(st_cpu, shift=(-0,-0,-0), axis=(0,1,2)), norm="forward")* ctf_cpu, norm="forward").real, shift=(0,0,0), axis=(0,1,2))
+        st_cpu = load_subtomogram_cpu(p, dtype=np.float32)
+        ctf_cpu = ctf_loader(p.replace(base_str, replace_str), transpose=False) if ctf_loader is not None else None
         return (p, st_cpu, ctf_cpu, None)
     except FileNotFoundError as e:
         return (p, None, None, e)
@@ -119,13 +117,46 @@ def worker_entry(config: ConfigDict, queue:mp.Queue, stop_event=None):
     - queue: mp.Queue
         Multiprocessing queue for inter-process communication.
     """
+    import signal
+
+    def _sigterm_handler(signum, frame):
+        print(f"[ERROR] GPU worker (device {config.gpu_id}) received SIGTERM.", flush=True)
+        try:
+            dev = torch.device(f"cuda:{int(config.gpu_id)}")
+            free, total = torch.cuda.mem_get_info(dev)
+            used_pct = (total - free) / total * 100
+            print(
+                f"[ERROR] GPU memory at termination: "
+                f"{(total - free) / 2**30:.1f}/{total / 2**30:.1f} GiB used ({used_pct:.0f}%).",
+                flush=True,
+            )
+            if used_pct > 90:
+                print(
+                    "[ERROR] GPU was nearly full — likely an out-of-memory condition. "
+                    "Try lowering 'auto_batch_safety' in config.yaml.",
+                    flush=True,
+                )
+        except Exception:
+            pass
+        if stop_event is not None:
+            stop_event.set()
+        sys.exit(2)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     from align_subtomograms import align  # must be top-level import
 
     try:
         align(config, queue)
-    except Exception:
+    except Exception as e:
         if stop_event is not None:
             stop_event.set()
+        if isinstance(e, torch.cuda.OutOfMemoryError) or (
+            isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+        ):
+            print(f"[ERROR] GPU worker ran out of memory: {e}", flush=True)
+            print("[ERROR] Try lowering 'auto_batch_safety' in config.yaml.", flush=True)
+            sys.exit(2)  # distinct exit code for OOM
         raise
 
 
@@ -134,7 +165,11 @@ class AlignmentRunJob:
 
     def __init__(self, config: ConfigDict):
         """Initialize run-level state used across worker and reader setup."""
-        self.config = copy.deepcopy(config)
+        raw = config.to_dict()
+        self._auto_batch = str(raw.get("num_subtomograms_per_batch", "")).lower() == "auto"
+        if self._auto_batch:
+            raw["num_subtomograms_per_batch"] = 1  # placeholder; replaced before workers spawn
+        self.config = ConfigDict(raw)
         self.ctx = mp.get_context("spawn")
         self.num_gpus = len(self.config.gpu_ids)
         self.stop_event = self.ctx.Event()
@@ -197,7 +232,7 @@ class AlignmentRunJob:
         class _LogProgress:
             """Minimal non-interactive progress reporter (stdout-friendly)."""
 
-            def __init__(self, total: int, desc: str = "cpu_reader"):
+            def __init__(self, total: int, desc: str = "matcha"):
                 self.total = max(0, int(total))
                 self.done = 0
                 self.desc = desc
@@ -229,19 +264,19 @@ class AlignmentRunJob:
 
         progress_bar = None
         try:
-            if config.relion_version == "relion5":
+            if bool(config.get("do_ctf_correction", True)):
                 ctf_loader = load_ctf_relion5_cpu
                 base_str, replace_str = "_data.", "_weights."
             else:
-                ctf_loader = load_ctf_cpu
-                base_str, replace_str = "_subtomo", "_ctf"
+                ctf_loader = None
+                base_str, replace_str = "", ""
 
             total_paths = sum(len(run_data[0][half]["subtomogram_paths"]) for half in run_data[0].keys())
             if tqdm is not None and total_paths > 0 and bool(config.get("show_progress_bar", True)):
                 if sys.stdout.isatty():
                     progress_bar = tqdm(
                         total=total_paths,
-                        desc="cpu_reader",
+                        desc="matcha",
                         unit="vol",
                         dynamic_ncols=True,
                         mininterval=float(config.get("progress_mininterval", 1.0)),
@@ -255,7 +290,7 @@ class AlignmentRunJob:
                         ),
                     )
                 else:
-                    progress_bar = _LogProgress(total=total_paths, desc="cpu_reader")
+                    progress_bar = _LogProgress(total=total_paths, desc="matcha")
 
             requested_workers = AlignmentRunJob._resolve_reader_workers(config=config, num_workers=num_workers)
             for half in run_data[0].keys():
@@ -347,7 +382,7 @@ class AlignmentRunJob:
                     )
                     buf_vol, buf_ctf, buf_paths = [], [], []
         except Exception as e:
-            print(f"[ERROR] cpu_reader encountered an error: {e}")
+            print(f"[ERROR] matcha: reader encountered an error: {e}")
             if stop_event is not None:
                 stop_event.set()
         finally:
@@ -361,18 +396,14 @@ class AlignmentRunJob:
                         pass
                 else:
                     q.put(None)
-            print("cpu_reader: Finished reading all data.")
+            if stop_event is not None and stop_event.is_set():
+                print("matcha: Stopped early — a GPU worker failed.")
+            else:
+                print("matcha: Finished reading all data.")
 
     def _prepare_run_data(self):
         """Discover subtomogram paths and build per-half data splits."""
-        if bool(self.config.get("particle_paths_from_star", False)):
-            subtomogram_paths = get_subtomogram_paths_from_particles(self.config.run_data_path)
-        else:
-            subtomogram_paths = find_mrc_in_selected_subdirs(
-                self.config.path_subtomograms,
-                self.config.subdirs_subtomograms,
-                self.config.subtomograms_file,
-            )
+        subtomogram_paths = get_subtomogram_paths_from_particles(self.config.particles_starfile)
         print(f"Found {len(subtomogram_paths)} subtomograms for alignment.")
         subtomogram_paths = subtomogram_paths[:]
         self.run_data = setup_data_splits(self.config, subtomogram_paths)
@@ -413,6 +444,142 @@ class AlignmentRunJob:
             f"max_inflight={self.reader_max_inflight}"
         )
 
+    def _find_batch_size(self) -> int:
+        """Probe GPU peak memory with a real forward pass, then extrapolate.
+
+        Probes at batch_size = S and 2S (where S = micro_batch_split) so that
+        both the rotation correlator (full-batch) and the shift matcher
+        (internally micro-batched at bs//2) scale between the two runs.
+        Fake zero inputs are used; a fake Fourier reference is injected directly
+        into ShiftMatcher so no template file is required.
+
+            max_batch = (free_vram * safety - fixed) / per_sample
+
+        The safety margin is read from config key 'auto_batch_safety' (default 0.80).
+        """
+        from align_subtomograms import AlignmentRuntimeBuilder
+        from utils.io_utils import extract_subtomogram_patch_batch
+        from utils.volume_rotation import rotate_volumes
+        import quaternionic
+
+        probe_gpu_id = self.config.gpu_ids[0]
+        probe_device = torch.device(f"cuda:{int(probe_gpu_id)}")
+        torch.cuda.set_device(probe_device)
+
+        micro_batch_split = int(self.config.get("micro_batch_split", 2))
+        # Probe at S and 2S so ShiftMatcher.micro_batch_size (= bs//2) also scales.
+        probe_sizes = (micro_batch_split, 2 * micro_batch_split)
+
+        mems = []
+        for bs in probe_sizes:
+            probe_dict = self.config.to_dict()
+            probe_dict["gpu_id"] = probe_gpu_id
+            probe_dict["num_subtomograms_per_batch"] = bs
+            probe_config = ConfigDict(probe_dict)
+
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(probe_device)
+            # Use mem_get_info so non-PyTorch CUDA allocations (NUFFT, cuFFT plans, etc.)
+            # are included in the measurement — max_memory_allocated misses these.
+            free_base, _total = torch.cuda.mem_get_info(probe_device)
+
+            runtime = fake_sub = fake_ctf = fake_shift = fake_rot = None
+            try:
+                runtime = AlignmentRuntimeBuilder.prepare_config(probe_config)
+                N = int(runtime.N)
+                dtype_c = runtime.execution.dtype
+                dtype_r = runtime.execution.dtype_real
+
+                # Inject fake template state so both matchers can run without real files.
+                fake_template_np = np.zeros((N, N, N), dtype=np.float32)
+                runtime.execution.Correlator.set_template(fake_template_np)
+                runtime.execution.ShiftMatcher.reference_data_fourier = torch.zeros(
+                    1, N, N, N, device=probe_device, dtype=dtype_c
+                )
+
+                fake_sub = torch.zeros(bs, N, N, N, device=probe_device, dtype=dtype_r)
+                fake_ctf = (
+                    torch.zeros(bs, N, N, N // 2 + 1, device=probe_device, dtype=dtype_r)
+                    if bool(probe_config.get("do_ctf_correction", True))
+                    else None
+                )
+                fake_shift = torch.zeros(bs, 1, 3, device=probe_device, dtype=dtype_r)
+                fake_rot = quaternionic.array(np.tile([[1.0, 0.0, 0.0, 0.0]], (bs, 1)))
+
+                with torch.no_grad():
+                    # Step 1: patch extraction + rotation (like _extract_rotated_batch)
+                    # normalize=False avoids div-by-zero on zero input
+                    batched_data = extract_subtomogram_patch_batch(
+                        volume=fake_sub,
+                        shift=fake_shift,
+                        config=runtime,
+                        normalize=False,
+                    )
+                    microbatch_size = max(1, bs // 2)
+                    batched_data = rotate_volumes(
+                        batched_data,
+                        fake_rot,
+                        microbatch_size=microbatch_size,
+                        permute_before_sample=False,
+                    )
+
+                    # Step 2: rotation search (full batch)
+                    coeffs, bh_norms = runtime.execution.Correlator.get_sigma(batched_data)
+                    del batched_data
+                    runtime.execution.RotationMatcher.search_orientations(sigma=coeffs)
+                    del coeffs, bh_norms
+
+                    # Step 3: shift search (internally micro-batched at bs//2)
+                    runtime.execution.ShiftMatcher.search_shifts(
+                        subtomos=fake_sub,
+                        ctfs=fake_ctf,
+                        shift_zyx=fake_shift,
+                        rotation_tracker=fake_rot,
+                    )
+
+                torch.cuda.synchronize(probe_device)
+                free_after, _ = torch.cuda.mem_get_info(probe_device)
+                # Memory consumed by this probe = baseline free minus current free.
+                # This captures PyTorch tensors + NUFFT/cuFFT allocations uniformly.
+                mems.append(free_base - free_after)
+
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print(
+                    f"[auto_batch] OOM during probe at batch_size={bs}; "
+                    f"falling back to batch_size={probe_sizes[0]}."
+                )
+                return probe_sizes[0]
+            finally:
+                del runtime, fake_sub, fake_ctf, fake_shift, fake_rot
+                torch.cuda.empty_cache()
+
+        mem_lo, mem_hi = mems
+        # Each probe step adds micro_batch_split particles, so per-sample cost is:
+        per_sample = (mem_hi - mem_lo) / micro_batch_split
+        fixed = mem_lo - micro_batch_split * per_sample
+
+        free, total = torch.cuda.mem_get_info(probe_device)
+
+        if per_sample <= 0:
+            print("[auto_batch] Per-sample memory estimate is non-positive; "
+                  f"using batch_size={probe_sizes[0]}.")
+            return probe_sizes[0]
+
+        safety = float(self.config.get("auto_batch_safety", 0.80))
+        max_batch = max(micro_batch_split, int((free * safety - max(0, fixed)) / per_sample))
+        # Round down to a multiple of micro_batch_split so all micro-batch
+        # chunks are equal size (avoids buffer mismatch in CrossCorrelationMatcher).
+        max_batch = max(micro_batch_split, (max_batch // micro_batch_split) * micro_batch_split)
+
+        gib = 1 << 30
+        print(
+            f"[auto_batch] GPU {probe_gpu_id}: {free/gib:.1f}/{total/gib:.1f} GiB free — "
+            f"fixed {fixed/gib:.2f} GiB, per-sample {per_sample/1e6:.1f} MB → "
+            f"batch_size = {max_batch}"
+        )
+        return max_batch
+
     def _spawn_workers(self):
         """Start one alignment worker process per configured GPU."""
         for i in range(self.num_gpus):
@@ -446,7 +613,8 @@ class AlignmentRunJob:
         while self.reader is not None and self.reader.is_alive():
             dead_workers = [process for process in self.processes if process.exitcode not in (None, 0)]
             if dead_workers and not self.stop_event.is_set():
-                print("[WARN] Worker terminated before reader finished. Stopping reader early.")
+                gpu_ids = [self.config.gpu_ids[self.processes.index(p)] for p in dead_workers]
+                print(f"[ERROR] GPU worker(s) on device(s) {gpu_ids} crashed. Stopping reader.")
                 self.stop_event.set()
                 break
             time.sleep(0.2)
@@ -463,10 +631,7 @@ class AlignmentRunJob:
 
     def _join_results(self):
         """Join per-worker outputs and report success status."""
-        if self.config.relion_version == "relion5":
-            success = join_data(self.config.run_data_path, workers=self.num_gpus, config=self.config)
-        else:
-            success = join_data_relion_old(self.config.run_data_path, workers=self.num_gpus, config=self.config)
+        success = join_data(self.config.particles_starfile, workers=self.num_gpus, config=self.config)
 
         if success:
             print(f"Done writing to {self.config.path_output+'.star'}")
@@ -478,12 +643,28 @@ class AlignmentRunJob:
         """Execute full alignment lifecycle (setup, spawn, stream, join)."""
         self._prepare_run_data()
         self._configure_output_path()
+        if self._auto_batch:
+            self.config.num_subtomograms_per_batch = self._find_batch_size()
         self._spawn_workers()
         self._start_reader()
         self._wait_for_completion()
 
         end_time = time.time()
-        print(f"Alignment completed in {end_time - self.start_time:.2f} seconds.")
+        failed = [p for p in self.processes if p.exitcode not in (None, 0)]
+        if failed:
+            gpu_ids = [self.config.gpu_ids[i] for i, p in enumerate(self.processes) if p.exitcode not in (None, 0)]
+            exit_codes = [p.exitcode for p in failed]
+            print(f"[ERROR] Alignment failed — GPU worker(s) on device(s) {gpu_ids} exited with error (exit codes: {exit_codes}).")
+            if any(p.exitcode == 2 for p in failed):
+                print("[ERROR] GPU ran out of memory. Try lowering 'auto_batch_safety' in config.yaml.")
+            elif any(p.exitcode in (-9, -15) for p in failed):
+                print("[ERROR] Worker(s) received a termination signal. This is usually caused by a scheduler "
+                      "time or memory limit (e.g. SLURM walltime/mem), or the job was cancelled externally. "
+                      "If this correlates with a higher 'auto_batch_safety', the SLURM RAM limit may be too low "
+                      "for the requested batch size — try lowering 'auto_batch_safety' in config.yaml or "
+                      "requesting more memory in your SLURM submission script (--mem / --mem-per-cpu).")
+        else:
+            print(f"Alignment completed in {end_time - self.start_time:.2f} seconds.")
         return self._join_results()
 
 

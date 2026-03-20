@@ -8,9 +8,9 @@ from ml_collections import ConfigDict
 from core.CrossCorrelationMatcher import CrossCorrelationMatcher
 from core.Matcha import Matcha
 from core.ShiftMatcher import ShiftMatcher
-from utils.io_utils import extract_patch_torch_batch2, load_template, store_alignment_parameters
+from utils.io_utils import extract_subtomogram_patch_batch, load_template, mask_effective_radius, store_alignment_parameters
 from utils.rotation_ops import update_rotation_estimate
-from utils.setup_utils import get_prior_shifts, get_rotation_tracker, pad_data, set_random_seed, setup_mask
+from utils.setup_utils import get_prior_shifts, get_rotation_tracker, pad_data, set_random_seed, setup_mask, resolve_precision_mode
 from utils.volume_rotation import rotate_volumes
 import warnings
 
@@ -29,15 +29,12 @@ class AlignmentRuntimeBuilder:
     def _build_matcha_config(runtime_config):
         """Build Matcha search settings, using config defaults when needed."""
         if "matcha_config" in runtime_config and runtime_config.matcha_config is not None:
-            return ConfigDict(runtime_config.matcha_config)
+            cfg = dict(runtime_config.matcha_config)
+            if "matcha_config_expert" in runtime_config and runtime_config.matcha_config_expert is not None:
+                cfg.update(dict(runtime_config.matcha_config_expert))
+            return ConfigDict(cfg)
 
-        li = []
-        if "lmaxs" in runtime_config:
-            li.extend(int(v) for v in runtime_config.lmaxs)
-        if "newton_ls" in runtime_config and len(runtime_config.newton_ls) > 0:
-            li.append(int(runtime_config.newton_ls[0]))
-        if not li:
-            li.append(int(runtime_config.bandlimit))
+        li = [40]
 
         return ConfigDict(
             {
@@ -47,7 +44,7 @@ class AlignmentRuntimeBuilder:
                 "num_steps": int(runtime_config.newton_steps) if "newton_steps" in runtime_config else 5,
                 "step_type": "newton",
                 "stop_early": bool(runtime_config.get("newton_stop_early", False)),
-                "oversampling_factor_K": int(runtime_config.get("so3fft_oversampling_factor", 2)),
+                "oversampling_factor_K": 2,
                 "do_random_sampling": False,
                 "reinits_iterations": 0,
             }
@@ -83,7 +80,9 @@ class AlignmentRuntimeBuilder:
         execution = ConfigDict()
         execution["shape"] = torch.tensor((runtime_config.N, runtime_config.N, runtime_config.N), device=device, dtype=torch.int64)
         execution["num_templates"] = 1
-        execution_dtype, execution_dtype_real = AlignmentRuntimeBuilder._resolve_precision(runtime_config.precision)
+        execution_dtype, execution_dtype_real = AlignmentRuntimeBuilder._resolve_precision(
+            runtime_config.get("precision", "float32")
+        )
         execution.dtype = execution_dtype
         execution.dtype_real = execution_dtype_real
         runtime_config.execution = execution
@@ -92,17 +91,20 @@ class AlignmentRuntimeBuilder:
         setup_mask(runtime_config)
 
         n = int(runtime_config.N)
-        bandlimit = int(runtime_config.bandlimit)
-        radius = int(runtime_config.radius)
-        expansion_epsilon = float(runtime_config.expansion_epsilon)
+        radius = min(int(runtime_config.get("radius", n // 2)), int(n // 2 * 0.95))
+        mask_path = str(runtime_config.get("path_template_mask", ""))
+        if mask_path:
+            radius = min(radius, int(mask_effective_radius(mask_path, n)))
+        expansion_epsilon = float(runtime_config.get("expansion_epsilon", 1e-4))
+        precision_mode = resolve_precision_mode(runtime_config)
         reduce_memory = bool(runtime_config.reduce_memory)
         micro_batch_split = int(getattr(runtime_config, "micro_batch_split", 2))
         num_subtomograms_per_batch = int(runtime_config.num_subtomograms_per_batch)
-        num_base_shifts = int(runtime_config.num_base_shifts)
+        num_base_shifts = 1
 
-        search_l_max = int(runtime_config.get("newton_ls", [runtime_config.bandlimit])[0])
         matcha_batchsize = num_subtomograms_per_batch * num_base_shifts
         matcha_config = AlignmentRuntimeBuilder._build_matcha_config(runtime_config)
+        search_l_max = max(matcha_config.Li)
 
         execution.RotationMatcher = Matcha(
             batchsize=matcha_batchsize,
@@ -122,12 +124,13 @@ class AlignmentRuntimeBuilder:
             expansion_epsilon=expansion_epsilon,
             batchsize=matcha_batchsize,
             reduce_memory=reduce_memory,
-            bandlimit=bandlimit,
+            bandlimit=search_l_max,
             micro_batch_split=micro_batch_split,
             dtype=execution_dtype_real,
             radius=radius,
             jl_zeros_path=runtime_config["jl_zeros_path"],
             cs_path=runtime_config["cs_path"],
+            precision_mode=precision_mode,
         )
 
         return runtime_config
@@ -150,7 +153,6 @@ class BatchProcessor:
         self.path_output = runtime_config.get("path_output_tmp", runtime_config.path_output)
         self.worker_id = runtime_config.worker_id if "worker_id" in runtime_config else None
         self.num_alternations = int(runtime_config["num_alternations"])
-        self.upsample_factors = runtime_config.upsample_factors
         self.microbatch_size = int(runtime_config.num_subtomograms_per_batch // 2)
         self.compute_stream = compute_stream
         self.num_subtomograms_per_batch = int(num_subtomograms_per_batch)
@@ -168,7 +170,6 @@ class BatchProcessor:
                 "rotation",
                 "translation",
                 "file_name",
-                "bin_factor",
                 "grid_shift",
                 "prior_shift",
                 "alternation_index",
@@ -238,7 +239,7 @@ class BatchProcessor:
 
     def _extract_rotated_batch(self, subtomograms, current_shift, rotation_tracker):
         """Extract shifted patches and rotate them into the current orientation estimate."""
-        batched_tomogram_data = extract_patch_torch_batch2(
+        batched_tomogram_data = extract_subtomogram_patch_batch(
             volume=subtomograms,
             shift=current_shift,
             config=self.runtime_config,
@@ -281,7 +282,6 @@ class BatchProcessor:
             ctfs=ctfs,
             shift_zyx=current_shift,
             rotation_tracker=rotation_tracker,
-            upsample_factor=self.upsample_factors[alternation_index],
         )
 
     def _store_batch_results(
@@ -413,7 +413,7 @@ class AlignmentJob:
         self.in_queue = in_queue
         self.device = self.runtime_config["device"]
         self.df = self._load_particles_df()
-        self.num_base_shifts = int(self.runtime_config["num_base_shifts"])
+        self.num_base_shifts = 1
         self.num_subtomograms_per_batch = int(self.runtime_config["num_subtomograms_per_batch"])
         self.copy_stream = torch.cuda.Stream(device=self.device)
         self.compute_stream = torch.cuda.current_stream(self.device)
@@ -427,7 +427,7 @@ class AlignmentJob:
 
     def _load_particles_df(self):
         """Load particle metadata table from the STAR file."""
-        df = starfile.read(self.runtime_config.run_data_path)
+        df = starfile.read(self.runtime_config.particles_starfile)
         df = df["particles"] if isinstance(df, dict) and "particles" in df else df
         df = df[2] if isinstance(df, list) else df
         return df

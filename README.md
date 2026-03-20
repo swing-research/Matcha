@@ -1,4 +1,4 @@
-# Matcha: Fast Subtomogram Alignment by Frequency-Marched Newton
+# Matcha: Fast Volume Alignment by Frequency-Marched Newton
 
 > Official implementation of **"Fast Volume Alignment by Frequency-Marched Newton"**
 
@@ -105,15 +105,15 @@ search_orientations timing: mean=XX.XX ms, std=XX.XX ms, total=XX.XX s for 1000 
 
 Edit `configs/config.yaml` to point to your data:
 
-| Field                | Description                               |
-| -------------------- | ----------------------------------------- |
-| `path_templates`     | List of two half-map `.mrc` files         |
-| `path_template_mask` | Optional mask `.mrc` (leave `""` to skip) |
-| `path_subtomograms`  | Directory containing subtomogram files    |
-| `run_data_path`      | RELION STAR file with particle metadata   |
-| `gpu_ids`            | List of GPU indices to use                |
-| `voxel_size`         | Voxel size in Å                           |
-| `box_size`           | Box size in pixels                        |
+| Field                 | Description                               |
+| --------------------- | ----------------------------------------- |
+| `path_templates`      | List of two half-map `.mrc` files         |
+| `path_template_mask`  | Optional mask `.mrc` (leave `""` to skip) |
+| `particles_starfile`  | RELION STAR file with particle metadata   |
+| `gpu_ids`             | List of GPU indices to use                |
+| `box_size`            | Box size in pixels                        |
+
+`N` (volume size) and `voxel_size` are read automatically from the template MRC header.
 
 Then run:
 
@@ -145,10 +145,12 @@ matcha --o External/jobXXX/       \
 | Behaviour       | Details                                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------------------- |
 | I/O override    | `--o`, `--in_parts`, `--in_3dref`, `--in_mask`, `--j`, GPU flags override the config                    |
+| `--mask_diameter` | Mask diameter in Å (same as the RELION GUI field). Sets `box_size = round(mask_diameter / voxel_size)` |
+| `--offset_range`  | Shift search radius in pixels (same as the RELION GUI "Offset range" field). Overrides `shift_search_radius` in the config |
 | Half-map pair   | If `--in_3dref` contains `half1`/`half2`, the counterpart is required at the same location              |
 | Single map      | If neither tag is present, the same map is used for both halves                                         |
 | Particle split  | Particles are split randomly into two halves from the input STAR                                        |
-| Output          | Particles STAR written to `<--o>/matcha_particles.star`                                                 |
+| Output          | Particles STAR written to `<--o>/matcha_particles.star`; config copied to `<--o>/matcha_config.yaml`    |
 | Lifecycle files | `RELION_JOB_EXIT_SUCCESS` / `RELION_JOB_EXIT_FAILURE` and `RELION_OUTPUT_NODES.star` written to `<--o>` |
 
 ---

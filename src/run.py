@@ -5,8 +5,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
+import mrcfile
 import ml_collections
 import pandas as pd
 import starfile
@@ -70,6 +72,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--j", type=int, default=0, help="RELION threads/cpu-workers setting.")
     parser.add_argument("--gpu_ids", type=str, default="", help="Comma-separated GPU ids override.")
     parser.add_argument("--gpus", type=int, default=0, help="GPU count override.")
+    parser.add_argument(
+        "--mask_diameter",
+        type=float,
+        default=0.0,
+        help="Mask diameter in Angstroms (RELION convention). Sets box_size = round(mask_diameter / voxel_size).",
+    )
+    parser.add_argument(
+        "--offset_range",
+        type=int,
+        default=0,
+        help="Shift search radius in voxels. Overrides shift_search_radius in config.",
+    )
     return parser
 
 
@@ -225,14 +239,30 @@ def _resolve_gpu_ids(args, extras, config):
 
 
 def _write_relion_output_nodes(output_dir: Path, output_particle_star: str):
+    # RELION 5 pipeline node types (src/pipeline_jobs.h):
+    #   0  = undefined
+    #   1  = movies
+    #   2  = micrographs
+    #   3  = particles (SPA)
+    #   4  = 2D class averages
+    #   5  = 3D class averages
+    #   6  = 3D reference map
+    #   7  = mask
+    #   9  = postprocess
+    #   13 = tomo tomograms STAR
+    #   15 = tomo particles STAR  <-- correct for subtomogram averaging
+    _TOMO_PARTS_NODE_TYPE = 15
+
     output_nodes_path = output_dir / "RELION_OUTPUT_NODES.star"
     df_nodes = pd.DataFrame(
         {
             "rlnPipeLineNodeName": [output_particle_star],
-            "rlnPipeLineNodeType": [3],
+            "rlnPipeLineNodeType": [_TOMO_PARTS_NODE_TYPE],
         }
     )
     starfile.write({"output_nodes": df_nodes}, output_nodes_path, overwrite=True)
+    print(f"[RELION] Output nodes: {output_nodes_path}")
+    print(f"[RELION]   {output_particle_star}  (type={_TOMO_PARTS_NODE_TYPE})")
 
 
 def _clear_relion_exit_markers(output_dir: Path):
@@ -246,7 +276,19 @@ def _touch_marker(output_dir: Path, marker_name: str):
     (output_dir / marker_name).touch()
 
 
-def _run_relion_mode(args, unknown_args, config):
+def _read_template_meta(path: str):
+    """Return (N, voxel_size_angstrom) from an MRC file header."""
+    with mrcfile.open(path, mode="r", permissive=True) as mrc:
+        shape = mrc.data.shape
+        voxel_size = float(mrc.voxel_size.x)
+    if len(shape) != 3 or shape[0] != shape[1] or shape[0] != shape[2]:
+        raise ValueError(
+            f"Template MRC is not a cube: shape={shape}. N cannot be inferred."
+        )
+    return shape[0], voxel_size
+
+
+def _run_relion_mode(args, unknown_args, config, config_path: Path):
     if not args.o:
         raise ValueError("RELION mode requires --o")
     if not args.in_parts:
@@ -257,6 +299,7 @@ def _run_relion_mode(args, unknown_args, config):
     extras = _parse_unknown_flags(unknown_args)
     output_dir = Path(args.o)
     output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_path, output_dir / "matcha_config.yaml")
     _clear_relion_exit_markers(output_dir)
 
     abort_now = output_dir / "RELION_JOB_ABORT_NOW"
@@ -270,14 +313,19 @@ def _run_relion_mode(args, unknown_args, config):
         from utils.run_utils import run_align
 
         config.relion_external_mode = True
-        config.particle_paths_from_star = True
         config.random_half_split = True
-        config.relion_version = "relion5"
         config.relion_output_stem = "matcha_particles"
         config.path_output = str(output_dir)
-        config.run_data_path = args.in_parts
+        config.particles_starfile = args.in_parts
         config.path_templates = _resolve_relion_templates(args.in_3dref)
-        config.subset_IDs = [1, 2]
+        config.subset_IDs = [1, 2] if bool(config.get("do_random_half", True)) else [1]
+
+        # Auto-read N and voxel_size from the template MRC (CLI flags take priority below)
+        template_N, template_voxel_size = _read_template_meta(config.path_templates[0])
+        config.N = template_N
+        config.voxel_size = template_voxel_size
+        config.radius = template_N // 2
+        print(f"[INFO] Template shape: N={template_N}, voxel_size={template_voxel_size:.4f} Å")
 
         if args.in_mask:
             config.path_template_mask = args.in_mask
@@ -294,6 +342,17 @@ def _run_relion_mode(args, unknown_args, config):
         if not config.gpu_ids:
             raise ValueError("Could not resolve any GPU ids from flags/env/config.")
 
+        if args.mask_diameter > 0.0:
+            config.box_size = round(args.mask_diameter / config.voxel_size)
+            config.radius = round(args.mask_diameter / (2.0 * config.voxel_size))
+            print(
+                f"[INFO] --mask_diameter={args.mask_diameter} Å → "
+                f"box_size={config.box_size}, radius={config.radius}"
+            )
+
+        if args.offset_range > 0:
+            config.shift_search_radius = args.offset_range
+
         reserved = {
             "o",
             "in_parts",
@@ -309,6 +368,8 @@ def _run_relion_mode(args, unknown_args, config):
             "gpu",
             "num_gpus",
             "ngpu",
+            "mask_diameter",
+            "offset_range",
         }
         for key, raw_value in extras.items():
             if key in reserved or key not in config:
@@ -361,7 +422,7 @@ def main(argv=None):
         _resolve_lookup_table_paths(config=config, config_path=config_path)
 
         if relion_mode:
-            _run_relion_mode(args=args, unknown_args=unknown_args, config=config)
+            _run_relion_mode(args=args, unknown_args=unknown_args, config=config, config_path=config_path)
             return
 
         if args.example:
@@ -377,7 +438,20 @@ def main(argv=None):
             from utils.setup_utils import assert_inputs
             from utils.run_utils import run_align
 
+            template_N, template_voxel_size = _read_template_meta(config.path_templates[0])
+            config.N = template_N
+            config.voxel_size = template_voxel_size
+            config.radius = template_N // 2
+            config.subset_IDs = [1, 2] if bool(config.get("do_random_half", True)) else [1]
+
+            if args.offset_range > 0:
+                config.shift_search_radius = args.offset_range
+
             assert_inputs(config)
+
+            out_dir = Path(config.path_output).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(config_path, out_dir / "matcha_config.yaml")
 
             # Run alignment
             run_align(config=config)
